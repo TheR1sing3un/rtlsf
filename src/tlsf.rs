@@ -167,7 +167,7 @@ impl<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: usize>
         None
     }
 
-    pub fn allocate(&mut self, min_size: usize) -> Option<NonNull<u8/*start address*/>> {
+    pub fn allocate(&mut self, min_size: usize) -> Ptr<BlockHeader> {
         let mut size = min_size + core::mem::size_of::<UsedBlockHeader>();
         if size < MIN_BLOCK_SIZE {
             size = MIN_BLOCK_SIZE;
@@ -191,6 +191,7 @@ impl<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: usize>
                     self.fl_bitmap.set(fl, false);
                 }
             }
+            self.free_list_headers[fl][sl] = block.as_ref().next_free_block;
 
             let mut last = block.as_ref().block_header.is_last();
             let mut need_block_size = block_size;
@@ -210,8 +211,30 @@ impl<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: usize>
             // return user need block's start address
             return Some(need_block.cast());
         }
-
         None
+    }
+
+    pub fn deallocate(&mut self, block: NonNull<BlockHeader>) {
+        unsafe {
+            let mut new_block = block;
+            let size = block.as_ref().size();
+            let prev_phys_block = block.as_ref().get_prev_phys_block();
+            if let Some(mut prev_phys_block) = prev_phys_block {
+                if prev_phys_block.as_ref().is_free() {
+                    // remove prev free block from list
+                    self.remove_free_block(prev_phys_block);
+                    // merge the previous free block and this free block
+                    let prev_size = prev_phys_block.as_ref().size();
+                    let last = block.as_ref().is_last();
+                    prev_phys_block.as_mut().set_size(prev_size + size);
+                    prev_phys_block.as_mut().set_last(last);
+                    new_block = prev_phys_block;
+                }
+            }
+            new_block.as_mut().set_free(true);
+            // insert deallocated block to free list
+            self.insert_free_block(new_block);
+        }
     }
 
     fn insert_free_block(&mut self, block_header: NonNull<BlockHeader>) {
@@ -234,11 +257,36 @@ impl<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: usize>
         }
     }
 
+    fn remove_free_block(&mut self, block_header: NonNull<BlockHeader>) {
+        unsafe {
+            let size = block_header.as_ref().size();
+            let (fl, sl) = self.map_search(size).unwrap();
+            let mut free_block = block_header.cast::<FreeBlockHeader>();
+            // remove from double-link free list
+            if let Some(mut next_free_block) = free_block.as_ref().next_free_block {
+                next_free_block.as_mut().prev_free_block = free_block.as_ref().prev_free_block;
+            }
+            if let Some(mut prev_free_block) = free_block.as_ref().prev_free_block {
+                prev_free_block.as_mut().next_free_block = free_block.as_ref().next_free_block;
+            }
+            // update free list header in bitmap and update bitmap value
+            if self.free_list_headers[fl][sl].unwrap().as_ptr() == free_block.as_ptr() {
+                self.free_list_headers[fl][sl] = free_block.as_ref().next_free_block;
+                if self.free_list_headers[fl][sl].is_none() {
+                    self.sl_bitmap[fl].set(sl, false);
+                    if self.sl_bitmap[fl].is_empty() {
+                        self.fl_bitmap.set(fl, false);
+                    }
+                }
+            }
+        }
+    }
+
 }
 
 mod tests {
 
-    use std::mem::MaybeUninit;
+    use std::{mem::MaybeUninit};
 
     use super::*;
 
@@ -320,7 +368,26 @@ mod tests {
     }
 
     #[test]
-    fn test_allocate() {
+    fn test_tlsf_remove_free_block() {
+        let mut tlsf: Tlsf<28, 4, 16> = Tlsf::new();
+        unsafe {
+            assert_eq!(tlsf.search_free_block(16), None);
+            let mut arena: [MaybeUninit<u8>;1024] = MaybeUninit::uninit().assume_init();
+            let mut block_header_ptr : NonNull<BlockHeader> = NonNull::new_unchecked(arena.as_mut_ptr().cast());
+            block_header_ptr.as_mut().set_metadata(1024, true, true);
+            tlsf.insert_free_block(block_header_ptr);
+            
+            assert_eq!(tlsf.search_free_block(16), Some((6, 0)));
+            assert_eq!(tlsf.search_free_block(1023), Some((6, 0)));
+            assert_eq!(tlsf.search_free_block(1024), None);
+
+            tlsf.remove_free_block(block_header_ptr);
+            assert_eq!(tlsf.search_free_block(16), None);
+        }
+    }
+
+    #[test]
+    fn test_allocate_deallocate() {
         let mut tlsf: Tlsf<28, 4, 16> = Tlsf::new();
         unsafe {
             assert_eq!(tlsf.allocate(16), None);
@@ -360,6 +427,30 @@ mod tests {
             assert_eq!(hdr5.as_ref().block_header.is_free(), false);
             assert_eq!(hdr5.as_ref().block_header.is_last(), true);
             assert_eq!(hdr5.as_ref().block_header.get_prev_phys_block().unwrap().cast::<u8>(), hdr4.cast());
+
+            assert_eq!(tlsf.allocate(16), None);
+
+            // deallocate block[927..1024]
+            tlsf.deallocate(ptr5.unwrap().cast());
+            let ptr6 = tlsf.allocate(69);
+            assert_eq!(ptr6.is_some(), true);
+            assert_eq!(ptr5, ptr6);
+
+            // deallocate block[0..32]
+            tlsf.deallocate(ptr.unwrap().cast());
+            let ptr7 = tlsf.allocate(800);
+            // only have 32B free block, so can't allocate 800B
+            assert_eq!(ptr7.is_none(), true);
+            
+            // deallocate block[32..927]
+            tlsf.deallocate(ptr4.unwrap().cast());
+            // now we have 895B free block and 32B free block, we expect these two blocks are merged to a 927B free block
+            let ptr8 = tlsf.allocate(800);
+            assert_eq!(ptr8.is_some(), true);
+            let hdr8 = ptr8.unwrap().cast::<UsedBlockHeader>();
+            assert_eq!(hdr8.as_ref().block_header.size(), 816);
+            assert_eq!(hdr8.as_ref().block_header.is_free(), false);
+            assert_eq!(block_header_ptr.cast(), ptr8.unwrap());
         }
     }
 }
