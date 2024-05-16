@@ -1,12 +1,15 @@
 use core::ptr::NonNull;
 
 use core::mem::size_of;
+use std::fmt::Display;
 
 use bitmaps::Bitmap;
 
-type Ptr<T> = Option<NonNull<T>>;
+pub type Ptr<T> = Option<NonNull<T>>;
 
 const DEFAULT_BIT_MAP_LEN: usize = 32;
+
+const BLOCK_MAGIC_NUMBER: usize = 0x1955938454;
 
 pub struct Tlsf<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: usize> {
     fl_bitmap: Bitmap<DEFAULT_BIT_MAP_LEN>,
@@ -14,19 +17,25 @@ pub struct Tlsf<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: us
     free_list_headers: [[Ptr<FreeBlockHeader>;SLLEN];FLLEN],
 }
 
+
+unsafe impl Send for Tlsf<26, 4, 64> {}
+
+unsafe impl Sync for Tlsf<26, 4, 64> {}
+
 /// The common header of a block.
 /// The metadata represents the size of the block and two flags.
 /// The first flag [F] indicates whether the block is free or not.
 /// The second flag [L] indicates whether this block is the last block of the memory pool.
 /// [size;L;F]
 #[derive(Debug)]
-struct BlockHeader {
-    metadata: usize,
-    prev_phys_block: Ptr<BlockHeader>
+pub struct BlockHeader {
+    pub magic: usize,
+    pub metadata: usize,
+    pub prev_phys_block: Ptr<BlockHeader>
 }
 
 impl BlockHeader {
-    fn new(size: usize, last: bool, free: bool, prev_phys_block: Ptr<BlockHeader>) -> Self {
+    pub fn new(size: usize, last: bool, free: bool, prev_phys_block: Ptr<BlockHeader>) -> Self {
         let mut metadata = size << 2;
         if last {
             metadata |= 0b10;
@@ -34,10 +43,14 @@ impl BlockHeader {
         if free {
             metadata |= 0b01;
         }
-        Self { metadata, prev_phys_block }
+        Self {
+            magic: BLOCK_MAGIC_NUMBER,
+            metadata,
+            prev_phys_block
+        }
     }
     
-    fn size(&self) -> usize {
+    pub fn size(&self) -> usize {
         self.metadata >> 2
     }
 
@@ -45,7 +58,7 @@ impl BlockHeader {
         self.metadata & 0b10 != 0
     }
 
-    fn is_free(&self) -> bool {
+    pub fn is_free(&self) -> bool {
         self.metadata & 0b01 != 0
     }
 
@@ -77,26 +90,57 @@ impl BlockHeader {
         self.metadata = (self.metadata & 0b11) | (size << 2);
     }
 
-    fn set_metadata(&mut self, size: usize, last: bool, free: bool) {
+    pub fn set_metadata(&mut self, size: usize, last: bool, free: bool) {
         self.metadata = size << 2;
-        if last {
-            self.metadata |= 0b10;
-        }
-        if free {
-            self.metadata |= 0b01;
-        }
+        self.set_last(last);
+        self.set_free(free);
+        self.magic = BLOCK_MAGIC_NUMBER;
     }
+
+    fn set_magic(&mut self) {
+        self.magic = BLOCK_MAGIC_NUMBER;
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.magic == BLOCK_MAGIC_NUMBER
+    }
+
+    fn next_block(&self) -> Ptr<BlockHeader> {
+        if self.is_last() {
+            return None;
+        }
+        let size = self.size();
+        return Some(unsafe {
+            let next_addr = self as *const BlockHeader as *mut u8 as usize + size;
+            NonNull::new(next_addr as *mut u8).unwrap().cast()
+        });
+    }
+}
+
+fn new_block_from_addr(addr: *mut u8, size: usize, last: bool, free: bool, prev_phys_block: Ptr<BlockHeader>) -> NonNull<BlockHeader> {
+    let mut block: NonNull<BlockHeader> = NonNull::new(addr).unwrap().cast();
+    unsafe {
+        block.as_mut().set_metadata(size, last, free);
+        block.as_mut().set_prev_phys_block(prev_phys_block);
+        block.as_mut().set_magic();
+    }
+    block.cast()
+}
+
+fn valid_size(size: usize) -> bool {
+    size >= 64 && size <= 1 << 18
 }
 
 #[derive(Debug)]
 struct FreeBlockHeader {
-    block_header: BlockHeader,
-    next_free_block: Ptr<FreeBlockHeader>,
-    prev_free_block: Ptr<FreeBlockHeader>
+    pub block_header: BlockHeader,
+    pub next_free_block: Ptr<FreeBlockHeader>,
+    pub prev_free_block: Ptr<FreeBlockHeader>
 }
 
+#[derive(Debug)]
 struct UsedBlockHeader {
-    block_header: BlockHeader
+    pub block_header: BlockHeader
 }
 
 impl<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: usize> 
@@ -115,6 +159,10 @@ impl<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: usize>
     const MAX_BLOCK_SIZE: usize = 1 << (FLLEN + Self::MIN_BLOCK_SIZE_LOG2);
 
     const SLI: usize = SLLEN.trailing_zeros() as usize;
+
+    pub fn max_block_size(&self) -> usize {
+        Self::MAX_BLOCK_SIZE
+    }
 
     fn map_search(&self, size: usize) -> Option<(usize/*fl-index*/, usize/*sl-index*/)> {
         let fl_phy_index = (usize::BITS - size.leading_zeros()) as usize - 1;
@@ -150,6 +198,11 @@ impl<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: usize>
         Some((fl, sl + 1))
     }
 
+    pub fn init_mem_pool(&mut self, addr: *mut u8, size: usize) {
+        let block = new_block_from_addr(addr, size, true, true, None);
+        self.insert_free_block(block);
+    }
+
     pub fn search_free_block(&self, min_size: usize) -> Option<(usize/*fl-index*/, usize/*sl-index*/)> {
         let (fl, sl) = self.map_search_bigger(min_size)?;
         if self.sl_bitmap[fl].get(sl) {
@@ -167,6 +220,8 @@ impl<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: usize>
         None
     }
 
+    // MIN_BLOCK_SIZE > sizeof(FreeBlockHeader)
+
     pub fn allocate(&mut self, min_size: usize) -> Ptr<BlockHeader> {
         let mut size = min_size + core::mem::size_of::<UsedBlockHeader>();
         if size < MIN_BLOCK_SIZE {
@@ -180,34 +235,50 @@ impl<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: usize>
             let block_size = block.as_ref().block_header.size();
             debug_assert!(block_size >= size);
 
-            // set next_free_block's prev_free_block as None
-            if let Some(mut next_free_block) = block.as_ref().next_free_block {
-                next_free_block.as_mut().prev_free_block = None;
-            } else {
-                // if this block is the last block of the free list
-                // update the bitmap
-                self.sl_bitmap[fl].set(sl, false);
-                if self.sl_bitmap[fl].is_empty() {
-                    self.fl_bitmap.set(fl, false);
-                }
-            }
-            self.free_list_headers[fl][sl] = block.as_ref().next_free_block;
+            self.remove_free_block(block.cast());
 
             let mut last = block.as_ref().block_header.is_last();
             let mut need_block_size = block_size;
 
-            if block_size > size + MIN_BLOCK_SIZE {
+            let mut split = false;
+            let mut split_block = None;
+
+            if block_size >= size + MIN_BLOCK_SIZE {
+
+                let next_phys_block = block.as_ref().block_header.next_block();
+
                 // split the block to two blocks, one is used and the other is free
-                let mut new_block: NonNull<BlockHeader> = NonNull::new_unchecked(block.cast::<u8>().as_ptr().add(size).cast());
-                new_block.as_mut().set_metadata(block_size - size, last, true);
-                new_block.as_mut().set_prev_phys_block(Some(block.cast()));
+                let new_block_addr = block.cast::<u8>().as_ptr().add(size);
+                let new_block = new_block_from_addr(new_block_addr, block_size - size, last, true, Some(block.cast()));
+                split_block = Some(new_block);
                 last = false;
                 // insert new block to the free list
+                debug_assert!(valid_size(new_block.as_ref().size()));
                 self.insert_free_block(new_block);
                 need_block_size = size;
+                split = true;
+                // update next block's prev_phys_block to new splitted block
+                if let Some(mut next_phys_block) = next_phys_block {
+                    next_phys_block.as_mut().set_prev_phys_block(Some(new_block));
+                }
             }
             let mut need_block = block.cast::<UsedBlockHeader>();
+            debug_assert!(need_block_size > 0);
+            
             need_block.as_mut().block_header.set_metadata(need_block_size, last, false);
+            
+            debug_assert!(valid_size(need_block.as_ref().block_header.size()));
+            debug_assert!(need_block.as_ref().block_header.is_valid());
+
+            if let Some(next_phys_block) = need_block.as_ref().block_header.next_block() {
+                debug_assert!(next_phys_block.as_ref().is_valid());
+            }
+
+            if split {
+                debug_assert_eq!(need_block.as_ref().block_header.next_block(), split_block);
+                debug_assert_eq!(split_block.unwrap().as_ref().prev_phys_block, Some(need_block.cast()));
+            }
+
             // return user need block's start address
             return Some(need_block.cast());
         }
@@ -217,41 +288,131 @@ impl<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: usize>
     pub fn deallocate(&mut self, block: NonNull<BlockHeader>) {
         unsafe {
             let mut new_block = block;
-            let size = block.as_ref().size();
-            let prev_phys_block = block.as_ref().get_prev_phys_block();
-            if let Some(mut prev_phys_block) = prev_phys_block {
-                if prev_phys_block.as_ref().is_free() {
-                    // remove prev free block from list
-                    self.remove_free_block(prev_phys_block);
-                    // merge the previous free block and this free block
-                    let prev_size = prev_phys_block.as_ref().size();
-                    let last = block.as_ref().is_last();
-                    prev_phys_block.as_mut().set_size(prev_size + size);
-                    prev_phys_block.as_mut().set_last(last);
-                    new_block = prev_phys_block;
+            let mut new_size = block.as_ref().size();
+            let mut new_prev_phys_block = block.as_ref().get_prev_phys_block();
+            let mut new_last = block.as_ref().is_last();
+            let mut merge_next = false;
+
+
+            let mut prev_addr;
+            let mut prev_size;
+            let mut mid_addr = block.as_ptr() as *const u8 as usize;
+            let mut mid_size = block.as_ref().size();
+            let mut next_addr;
+            let mut next_size;
+            let mut next_next_addr;
+
+
+            if !block.as_ref().is_valid() {
+                panic!("block is not free");
+            }
+
+            debug_assert!(block.as_ref().is_valid());
+
+            let mut need_update_next_block = None;
+
+            // Check if next block is free or not, if free, merge them and update the next block's next block's prev_phys_block
+            if let Some(next_phys_block)  = new_block.as_ref().next_block() {
+
+                next_addr = next_phys_block.as_ptr() as *const u8 as usize;
+                next_size = next_phys_block.as_ref().size();
+
+                if !next_phys_block.as_ref().is_valid() && new_block.as_ref().is_last() {
+                    panic!("fuck");
+                }
+
+                debug_assert_eq!(mid_addr + mid_size, next_addr);
+
+                debug_assert!(next_phys_block.as_ref().is_valid());
+
+                if next_phys_block.as_ref().is_free() {
+                    merge_next = true;
+                    need_update_next_block = next_phys_block.as_ref().next_block();
+                    if let Some(need) = need_update_next_block {
+                        next_next_addr = need.as_ptr() as *const u8 as usize;
+                    }
+
+                    // remove next free block from list
+                    self.remove_free_block(next_phys_block);
+                    // merge the next free block and this free block
+                    new_size += next_phys_block.as_ref().size();
+                    new_last = next_phys_block.as_ref().is_last();
+                } else {
+                    need_update_next_block = Some(next_phys_block);
                 }
             }
-            new_block.as_mut().set_free(true);
+
+            // Check if previous block is free or not, if free, merge them
+            if let Some(prev_phys_block) = block.as_ref().get_prev_phys_block() {
+                
+                prev_addr = prev_phys_block.as_ptr() as *const u8 as usize;
+                prev_size = prev_phys_block.as_ref().size();
+
+                debug_assert_eq!(prev_addr + prev_size, mid_addr);
+
+                debug_assert!(prev_phys_block.as_ref().is_valid());
+
+                if prev_phys_block.as_ref().is_free() {
+                    new_size += prev_phys_block.as_ref().size();
+                    new_prev_phys_block = prev_phys_block.as_ref().get_prev_phys_block();
+                    new_block = prev_phys_block;
+                    // remove previous free block from list
+                    self.remove_free_block(prev_phys_block);
+                }
+            }
+
+            // Create new free block
+            new_block.as_mut().set_metadata(new_size, new_last, true);
+            new_block.as_mut().set_prev_phys_block(new_prev_phys_block);
+
+            // Update next block's prev_phys_block
+            if let Some(mut next_phys_block) = need_update_next_block {
+                next_phys_block.as_mut().set_prev_phys_block(Some(new_block));
+            }
+            
+            debug_assert!(new_block.as_ref().is_valid());
+            debug_assert!(valid_size(new_block.as_ref().size()));
+
+            // if let Some(next_phys_block) = new_block.as_ref().next_block() {
+            //     debug_assert!(next_phys_block.as_ref().is_valid());
+            // }
+
+            if let Some(b) = need_update_next_block {
+                let addr0 = new_block.as_ptr() as *const u8 as usize;
+                let addr1 = b.as_ptr() as *const u8 as usize;
+                let addr2 = new_block.as_ref().next_block().unwrap().as_ptr() as *const u8 as usize;
+                debug_assert!(b.as_ref().is_valid());
+                debug_assert_eq!(b.as_ref().get_prev_phys_block(), Some(new_block));
+                debug_assert_eq!(new_block.as_ref().next_block(), Some(b));
+            }
+
             // insert deallocated block to free list
             self.insert_free_block(new_block);
         }
     }
 
-    fn insert_free_block(&mut self, block_header: NonNull<BlockHeader>) {
+    pub fn insert_free_block(&mut self, block_header: NonNull<BlockHeader>) {
         unsafe {
             let size = block_header.as_ref().size();
+            
+            debug_assert!(valid_size(size));
+
             let (fl, sl) = self.map_search(size).unwrap();
             let mut free_block = block_header.cast::<FreeBlockHeader>();
+            debug_assert_eq!(free_block.as_ref().block_header.size(), size);
             if let Some(mut first_free_block) = self.free_list_headers[fl][sl] {
+                debug_assert!(first_free_block.as_ref().block_header.is_valid());
+                first_free_block.as_mut().prev_free_block = Some(free_block);
                 free_block.as_mut().next_free_block = Some(first_free_block);
                 free_block.as_mut().prev_free_block = None;
-                first_free_block.as_mut().prev_free_block = Some(free_block);
             } else {
                 free_block.as_mut().next_free_block = None;
                 free_block.as_mut().prev_free_block = None;
             }
+
             // set this block as the first block of the free list
-            self.free_list_headers[fl][sl] = Some(free_block);            
+            self.free_list_headers[fl][sl] = Some(free_block);
+
             self.sl_bitmap[fl].set(sl, true);
             self.fl_bitmap.set(fl, true);
         }
@@ -261,17 +422,35 @@ impl<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: usize>
         unsafe {
             let size = block_header.as_ref().size();
             let (fl, sl) = self.map_search(size).unwrap();
-            let mut free_block = block_header.cast::<FreeBlockHeader>();
+            let mut free_block: NonNull<FreeBlockHeader> = block_header.cast::<FreeBlockHeader>();
+            debug_assert_eq!(free_block.as_ref().block_header.size(), size);
+            debug_assert!(free_block.as_ref().block_header.is_valid());
+
+            let mut new_first_block: Ptr<FreeBlockHeader> = None;
             // remove from double-link free list
             if let Some(mut next_free_block) = free_block.as_ref().next_free_block {
+                debug_assert!(next_free_block.as_ref().block_header.is_valid());
                 next_free_block.as_mut().prev_free_block = free_block.as_ref().prev_free_block;
             }
             if let Some(mut prev_free_block) = free_block.as_ref().prev_free_block {
+                debug_assert!(prev_free_block.as_ref().block_header.is_valid());
                 prev_free_block.as_mut().next_free_block = free_block.as_ref().next_free_block;
+                if let Some(aa) = prev_free_block.as_ref().next_free_block {
+                    let sz = aa.as_ref().block_header.size();
+                    if sz == 0 || sz > 1<<18 {
+                        panic!("size: {}", sz);
+                    }
+                    
+                }
             }
+            
             // update free list header in bitmap and update bitmap value
-            if self.free_list_headers[fl][sl].unwrap().as_ptr() == free_block.as_ptr() {
-                self.free_list_headers[fl][sl] = free_block.as_ref().next_free_block;
+            if self.free_list_headers[fl][sl] == Some(free_block) {
+                let next_free_block = free_block.as_ref().next_free_block;
+                self.free_list_headers[fl][sl] = next_free_block;
+                
+                debug_assert!(next_free_block.is_none() || next_free_block.unwrap().as_ref().block_header.is_valid());
+
                 if self.free_list_headers[fl][sl].is_none() {
                     self.sl_bitmap[fl].set(sl, false);
                     if self.sl_bitmap[fl].is_empty() {
@@ -279,9 +458,11 @@ impl<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: usize>
                     }
                 }
             }
+            
+            free_block.as_mut().next_free_block = None;
+            free_block.as_mut().prev_free_block = None;
         }
     }
-
 }
 
 mod tests {
@@ -297,6 +478,10 @@ mod tests {
         assert_eq!(block_header.is_last(), false);
         assert_eq!(block_header.is_free(), true);
         assert_eq!(block_header.get_prev_phys_block(), None);
+
+        assert_eq!(size_of::<BlockHeader>(), 24);
+        assert_eq!(size_of::<FreeBlockHeader>(), 40);
+        assert_eq!(size_of::<UsedBlockHeader>(), 24);
     }
 
 
@@ -352,6 +537,47 @@ mod tests {
     }
 
     #[test]
+    fn test_cast() {
+        let mut tlsf: Tlsf<28, 4, 16> = Tlsf::new();
+        unsafe {
+            let mut arena: [MaybeUninit<u8>;1024] = MaybeUninit::uninit().assume_init();
+            let mut block_header_ptr : NonNull<BlockHeader> = NonNull::new_unchecked(arena.as_mut_ptr().cast());
+            block_header_ptr.as_mut().set_metadata(1024, true, true);
+            assert_eq!(1024, block_header_ptr.as_ref().size());
+            assert_eq!(block_header_ptr.as_ref().is_last(), true);
+            assert_eq!(block_header_ptr.as_ref().is_free(), true);
+            assert_eq!(block_header_ptr.as_ref().get_prev_phys_block(), None);
+
+
+            let mut free_block_ptr = block_header_ptr.cast::<FreeBlockHeader>();
+            assert_eq!(1024, free_block_ptr.as_ref().block_header.size());
+            assert_eq!(free_block_ptr.as_ref().block_header.is_last(), true);
+            assert_eq!(free_block_ptr.as_ref().block_header.is_free(), true);
+            assert_eq!(free_block_ptr.as_ref().block_header.get_prev_phys_block(), None);
+            assert_eq!(free_block_ptr.as_ref().next_free_block, None);
+            assert_eq!(free_block_ptr.as_ref().prev_free_block, None);
+
+            free_block_ptr.as_mut().next_free_block = Some(block_header_ptr.cast());
+
+            let mut used_block_ptr = block_header_ptr.cast::<UsedBlockHeader>();
+            used_block_ptr.as_mut().block_header.set_free(false);
+            assert_eq!(1024, used_block_ptr.as_ref().block_header.size());
+            assert_eq!(used_block_ptr.as_ref().block_header.is_last(), true);
+            assert_eq!(used_block_ptr.as_ref().block_header.is_free(), false);
+            assert_eq!(used_block_ptr.as_ref().block_header.get_prev_phys_block(), None);
+
+            let mut free_block_ptr_2 = used_block_ptr.cast::<FreeBlockHeader>();
+            assert_eq!(1024, free_block_ptr_2.as_ref().block_header.size());
+            assert_eq!(free_block_ptr_2.as_ref().block_header.is_last(), true);
+            assert_eq!(free_block_ptr_2.as_ref().block_header.is_free(), false);
+            assert_eq!(free_block_ptr_2.as_ref().block_header.get_prev_phys_block(), None);
+            assert_eq!(free_block_ptr_2.as_ref().next_free_block, Some(block_header_ptr.cast()));
+            assert_eq!(free_block_ptr_2.as_ref().prev_free_block, None);
+
+        }
+    }
+
+    #[test]
     fn test_tlsf_insert_free_block() {
         let mut tlsf: Tlsf<28, 4, 16> = Tlsf::new();
         unsafe {
@@ -387,6 +613,75 @@ mod tests {
     }
 
     #[test]
+    fn test_tlsf_insert_remove_free_block() {
+        let mut tlsf: Tlsf<28, 4, 16> = Tlsf::new();
+        unsafe {
+            assert_eq!(tlsf.search_free_block(16), None);
+            let mut arena: [MaybeUninit<u8>;10240] = MaybeUninit::uninit().assume_init();
+            let mut block_header_ptr_0 : NonNull<BlockHeader> = NonNull::new_unchecked(arena.as_mut_ptr().cast());
+            block_header_ptr_0.as_mut().set_metadata(1024, false, true);
+            tlsf.insert_free_block(block_header_ptr_0);
+            
+            assert_eq!(tlsf.search_free_block(16), Some((6, 0)));
+            assert_eq!(tlsf.search_free_block(1023), Some((6, 0)));
+            assert_eq!(tlsf.search_free_block(1024), None);
+            let mut block_header_ptr_1 : NonNull<BlockHeader> = NonNull::new_unchecked(arena.as_mut_ptr().add(1024).cast());
+            block_header_ptr_1.as_mut().set_metadata(1024, true, true);
+            tlsf.insert_free_block(block_header_ptr_1);
+            assert_eq!(tlsf.search_free_block(16), Some((6, 0)));
+            assert_eq!(tlsf.search_free_block(1023), Some((6, 0)));
+            assert_eq!(tlsf.search_free_block(1024), None);
+
+            let mut target = tlsf.free_list_headers[6][0];
+
+            assert_eq!(target.is_some(), true);
+            assert_eq!(target.unwrap().as_ptr(), block_header_ptr_1.as_ptr().cast());
+            assert_eq!(target.unwrap().as_ref().next_free_block, Some(block_header_ptr_0.cast()));
+            assert_eq!(target.unwrap().as_ref().prev_free_block, None);
+
+            tlsf.remove_free_block(block_header_ptr_1);
+            assert_eq!(tlsf.search_free_block(16), Some((6, 0)));
+            assert_eq!(tlsf.search_free_block(1023), Some((6, 0)));
+            assert_eq!(tlsf.search_free_block(1024), None);
+            
+            target = tlsf.free_list_headers[6][0];
+            assert_eq!(target.is_some(), true);
+            assert_eq!(target.unwrap().as_ptr(), block_header_ptr_0.as_ptr().cast());
+            assert_eq!(target.unwrap().as_ref().next_free_block, None);
+            assert_eq!(target.unwrap().as_ref().prev_free_block, None);
+
+            tlsf.remove_free_block(block_header_ptr_0);
+
+            target = tlsf.free_list_headers[6][0];
+            assert_eq!(target.is_none(), true);
+
+            assert_eq!(tlsf.search_free_block(16), None);
+        }
+    }
+
+    #[test]
+    fn test_next_block() {
+        let mut tlsf: Tlsf<28, 4, 16> = Tlsf::new();
+        unsafe {
+            assert_eq!(tlsf.allocate(16), None);
+
+            let mut arena: [MaybeUninit<u8>;1024] = MaybeUninit::uninit().assume_init();
+            let mut block_header_ptr : NonNull<BlockHeader> = NonNull::new_unchecked(arena.as_mut_ptr().cast());
+            tlsf.init_mem_pool(arena.as_mut_ptr().cast(), 1024);
+
+            let ptr_0 = tlsf.allocate(128).unwrap();
+
+            let ptr_1 = tlsf.allocate(128).unwrap();
+
+            let ptr_2 = tlsf.allocate(128).unwrap();
+
+            assert_eq!(ptr_0.as_ref().next_block(), Some(ptr_1));
+            assert_eq!(ptr_1.as_ref().next_block(), Some(ptr_2));
+        
+        }
+    }
+
+    // #[test]
     fn test_allocate_deallocate() {
         let mut tlsf: Tlsf<28, 4, 16> = Tlsf::new();
         unsafe {
@@ -394,14 +689,13 @@ mod tests {
 
             let mut arena: [MaybeUninit<u8>;1024] = MaybeUninit::uninit().assume_init();
             let mut block_header_ptr : NonNull<BlockHeader> = NonNull::new_unchecked(arena.as_mut_ptr().cast());
-            block_header_ptr.as_mut().set_metadata(1024, true, true);
-            tlsf.insert_free_block(block_header_ptr);
+            tlsf.init_mem_pool(arena.as_mut_ptr().cast(), 1024);
 
             let ptr = tlsf.allocate(16);
             assert_eq!(ptr.is_some(), true);
             assert_eq!(block_header_ptr.cast(), ptr.unwrap());
             let hdr = ptr.unwrap().cast::<UsedBlockHeader>();
-            assert_eq!(hdr.as_ref().block_header.size(), 32);
+            assert_eq!(hdr.as_ref().block_header.size(), 40);
             assert_eq!(hdr.as_ref().block_header.is_free(), false);
             assert_eq!(hdr.as_ref().block_header.is_last(), false);
             assert_eq!(hdr.as_ref().block_header.get_prev_phys_block(), None);
