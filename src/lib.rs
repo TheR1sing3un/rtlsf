@@ -1,10 +1,11 @@
 mod tlsf;
+// mod tctlsf;
 
 mod tests {
 
-    use crate::tlsf::{self, Tlsf, BlockHeader, Ptr};
+    use crate::tlsf::{self, BlockHeader, MemoryManager, Ptr, Tlsf};
 
-    use std::{cell::RefCell, mem::MaybeUninit, sync::{Arc, Barrier, Mutex}, time::Instant};
+    use std::{cell::RefCell, mem::MaybeUninit, sync::{Arc, Barrier, Mutex}, time::Instant, usize::MIN};
     use core::ptr::NonNull;
     use rand::{thread_rng, Rng};
     
@@ -13,10 +14,10 @@ mod tests {
         const MIN_BLOCK_SIZE: usize = 64;
         const FLLEN: usize = 26;
         const SLLEN: usize = 4;
-        const CONCURRENT_NUM: usize = 64;
+        const CONCURRENT_NUM: usize = 4;
         const LOOP_TIMES: usize = 1_000_000; 
 
-        let mut tlsf: Tlsf<FLLEN, SLLEN, MIN_BLOCK_SIZE> = Tlsf::new();
+        let mut tlsf = Tlsf::new(FLLEN, SLLEN, MIN_BLOCK_SIZE);
         unsafe {
             let mut arena: [MaybeUninit<u8>;1 << 18] = MaybeUninit::uninit().assume_init();
 
