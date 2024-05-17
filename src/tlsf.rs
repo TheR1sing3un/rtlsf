@@ -1,23 +1,22 @@
-use core::ptr::NonNull;
+use core::{fmt, ptr::NonNull};
 
-use std::fmt::Display;
+use std::{fmt::Display, rc::Rc};
 
 use bitmaps::Bitmap;
+use rand::{thread_rng, Rng};
 
 pub type Ptr<T> = Option<NonNull<T>>;
+
+pub type BlockHeaderPtr = NonNull<BlockHeader>;
 
 const DEFAULT_BIT_MAP_LEN: usize = 32;
 
 const BLOCK_MAGIC_NUMBER: usize = 0x1955938454;
 
-// pub struct Tlsf<const FLLEN: usize, const SLLEN: usize, const MIN_BLOCK_SIZE: usize> {
-//     fl_bitmap: Bitmap<DEFAULT_BIT_MAP_LEN>,
-//     sl_bitmap: [Bitmap<DEFAULT_BIT_MAP_LEN>; FLLEN],
-//     free_list_headers: [[Ptr<FreeBlockHeader>;SLLEN];FLLEN],
-// }
 
-#[derive(Debug)]
-pub struct Tlsf {
+pub type MergeFunc<'a> = Box<dyn Fn(BlockHeaderPtr) -> bool + 'a>;
+
+pub struct Tlsf<'a> {
     fl_len: usize,
     sl_len: usize,
     min_block_size: usize,
@@ -27,10 +26,24 @@ pub struct Tlsf {
     fl_bitmap: Bitmap<DEFAULT_BIT_MAP_LEN>,
     sl_bitmap: Vec<Bitmap<DEFAULT_BIT_MAP_LEN>>,
     free_list_headers: Vec<Vec<Ptr<FreeBlockHeader>>>,
+    merge_func: Option<MergeFunc<'a>>,
+    rand: usize,
 }
 
-unsafe impl Send for Tlsf {}
-unsafe impl Sync for Tlsf {}
+unsafe impl <'a>Send for Tlsf<'a> {}
+unsafe impl <'a>Sync for Tlsf<'a> {}
+
+pub trait ThreadSafeMemoryManager : Send + Sync {
+    fn init_mem_pool(&self, mem_pool: *mut u8, mem_pool_size: usize);
+    fn allocate(&self, size: usize) -> Option<BlockHeaderPtr>;
+    fn deallocate(&self, block: BlockHeaderPtr) -> BlockHeaderPtr;
+}
+
+pub trait MemoryManager {
+    fn init_mem_pool(&mut self, addr: *mut u8, size: usize);
+    fn allocate(&mut self, size: usize) -> Ptr<BlockHeader>;
+    fn deallocate(&mut self, block: BlockHeaderPtr) -> BlockHeaderPtr;
+}
 
 /// The common header of a block.
 /// The metadata represents the size of the block and two flags.
@@ -100,11 +113,17 @@ impl BlockHeader {
         self.metadata = (self.metadata & 0b11) | (size << 2);
     }
 
-    pub fn set_metadata(&mut self, size: usize, last: bool, free: bool) {
+    pub fn initialize(&mut self, size: usize, last: bool, free: bool, prev_phys_block: Ptr<BlockHeader>) {
+        self.set_metadata(size, last, free);
+        self.set_prev_phys_block(prev_phys_block);
+        self.set_magic();
+    }
+
+
+    fn set_metadata(&mut self, size: usize, last: bool, free: bool) {
         self.metadata = size << 2;
         self.set_last(last);
         self.set_free(free);
-        self.magic = BLOCK_MAGIC_NUMBER;
     }
 
     fn set_magic(&mut self) {
@@ -115,7 +134,7 @@ impl BlockHeader {
         self.magic == BLOCK_MAGIC_NUMBER
     }
 
-    fn next_block(&self) -> Ptr<BlockHeader> {
+    pub fn next_block(&self) -> Ptr<BlockHeader> {
         if self.is_last() {
             return None;
         }
@@ -127,12 +146,10 @@ impl BlockHeader {
     }
 }
 
-fn new_block_from_addr(addr: *mut u8, size: usize, last: bool, free: bool, prev_phys_block: Ptr<BlockHeader>) -> NonNull<BlockHeader> {
-    let mut block: NonNull<BlockHeader> = NonNull::new(addr).unwrap().cast();
+fn new_block_from_addr(addr: *mut u8, size: usize, last: bool, free: bool, prev_phys_block: Ptr<BlockHeader>) -> BlockHeaderPtr {
+    let mut block: BlockHeaderPtr = NonNull::new(addr).unwrap().cast();
     unsafe {
-        block.as_mut().set_metadata(size, last, free);
-        block.as_mut().set_prev_phys_block(prev_phys_block);
-        block.as_mut().set_magic();
+        block.as_mut().initialize(size, last, free, prev_phys_block);
     }
     block.cast()
 }
@@ -153,21 +170,9 @@ struct UsedBlockHeader {
     pub block_header: BlockHeader
 }
 
-
-impl Display for UsedBlockHeader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "UsedBlockHeader")
-    }
-}
-
-pub trait MemoryManager {
-    fn init_mem_pool(&mut self, addr: *mut u8, size: usize);
-    fn allocate(&mut self, size: usize) -> Ptr<BlockHeader>;
-    fn deallocate(&mut self, block: NonNull<BlockHeader>);
-}
-
-impl Tlsf {
-    pub fn new(fl_len: usize, sl_len: usize, min_block_size: usize) -> Self {
+impl <'a>Tlsf<'a> {
+    pub fn with_merge_func(fl_len: usize, sl_len: usize, min_block_size: usize,
+        merge_func: Option<MergeFunc<'a>>) -> Self {
         let mut sl_bitmap = Vec::with_capacity(fl_len);
         let mut free_list_headers = Vec::with_capacity(fl_len);
         for _ in 0..fl_len {
@@ -181,7 +186,8 @@ impl Tlsf {
         let min_block_size_log2 = min_block_size.trailing_zeros() as usize;
         let max_block_size = 1 << (fl_len + min_block_size_log2);
         let sli = sl_len.trailing_zeros() as usize;
-        Self {
+        let rand : usize = thread_rng().gen_range(0..123214798) as usize;
+        let a = Self {
             fl_len,
             sl_len,
             min_block_size,
@@ -191,6 +197,31 @@ impl Tlsf {
             fl_bitmap: Bitmap::new(),
             sl_bitmap,
             free_list_headers,
+            merge_func,
+            rand
+        };
+        return a;
+    }
+
+    pub fn new(fl_len: usize, sl_len: usize, min_block_size: usize) -> Self {
+        Self::with_merge_func(fl_len, sl_len, min_block_size, Some(Box::new(Self::default_merge_permit)))
+    }
+
+    pub fn register_merge_func(&mut self, merge_func: MergeFunc<'a>) {
+        self.merge_func = Some(merge_func);
+    }
+
+    fn merge_permit(&self, block: BlockHeaderPtr) -> bool {
+        if let Some(func) = &self.merge_func {
+            let aa = func;
+            return aa(block);
+        }
+        return Self::default_merge_permit(block);
+    }
+
+    fn default_merge_permit(block: BlockHeaderPtr) -> bool {
+        unsafe {
+            block.as_ref().is_valid() && block.as_ref().is_free()
         }
     }
 
@@ -251,7 +282,7 @@ impl Tlsf {
 
     // MIN_BLOCK_SIZE > sizeof(FreeBlockHeader)
 
-    fn insert_free_block(&mut self, block_header: NonNull<BlockHeader>) {
+    fn insert_free_block(&mut self, block_header: BlockHeaderPtr) {
         unsafe {
             let size = block_header.as_ref().size();
             
@@ -278,7 +309,7 @@ impl Tlsf {
         }
     }
 
-    fn remove_free_block(&mut self, block_header: NonNull<BlockHeader>) {
+    fn remove_free_block(&mut self, block_header: BlockHeaderPtr) {
         unsafe {
             let size = block_header.as_ref().size();
             let (fl, sl) = self.map_search(size).unwrap();
@@ -323,9 +354,10 @@ impl Tlsf {
             free_block.as_mut().prev_free_block = None;
         }
     }
+
 }
 
-impl MemoryManager for Tlsf {
+impl <'a>MemoryManager for Tlsf<'a> {
     fn init_mem_pool(&mut self, addr: *mut u8, size: usize) {
         let block = new_block_from_addr(addr, size, true, true, None);
         self.insert_free_block(block);
@@ -393,7 +425,7 @@ impl MemoryManager for Tlsf {
         }
     }
 
-    fn deallocate(&mut self, block: NonNull<BlockHeader>) {
+    fn deallocate(&mut self, block: BlockHeaderPtr) -> BlockHeaderPtr /* after-merge block */ {
         unsafe {
             let mut new_block = block;
             let mut new_size = block.as_ref().size();
@@ -412,13 +444,9 @@ impl MemoryManager for Tlsf {
             // Check if next block is free or not, if free, merge them and update the next block's next block's prev_phys_block
             if let Some(next_phys_block)  = new_block.as_ref().next_block() {
 
-                if !next_phys_block.as_ref().is_valid() && new_block.as_ref().is_last() {
-                    panic!("fuck");
-                }
-
                 debug_assert!(next_phys_block.as_ref().is_valid());
 
-                if next_phys_block.as_ref().is_free() {
+                if self.merge_permit(next_phys_block) {
                     need_update_next_block = next_phys_block.as_ref().next_block();
 
                     // remove next free block from list
@@ -436,7 +464,7 @@ impl MemoryManager for Tlsf {
 
                 debug_assert!(prev_phys_block.as_ref().is_valid());
 
-                if prev_phys_block.as_ref().is_free() {
+                if self.merge_permit(prev_phys_block) {
                     new_size += prev_phys_block.as_ref().size();
                     new_prev_phys_block = prev_phys_block.as_ref().get_prev_phys_block();
                     new_block = prev_phys_block;
@@ -446,8 +474,7 @@ impl MemoryManager for Tlsf {
             }
 
             // Create new free block
-            new_block.as_mut().set_metadata(new_size, new_last, true);
-            new_block.as_mut().set_prev_phys_block(new_prev_phys_block);
+            new_block.as_mut().initialize(new_size, new_last, true, new_prev_phys_block);
 
             // Update next block's prev_phys_block
             if let Some(mut next_phys_block) = need_update_next_block {
@@ -459,6 +486,7 @@ impl MemoryManager for Tlsf {
 
             // insert deallocated block to free list
             self.insert_free_block(new_block);
+            new_block
         }
     }
 }
@@ -488,7 +516,7 @@ mod tests {
     #[test]
     fn test_tlsf_new() {
         let tlsf = Tlsf::new(28, 4, 16);
-        println!("{:?}", tlsf);
+        // println!("{:?}", tlsf);
     }
 
     #[test]
@@ -542,8 +570,8 @@ mod tests {
         let mut tlsf = Tlsf::new(28, 4, 16);
         unsafe {
             let mut arena: [MaybeUninit<u8>;1024] = MaybeUninit::uninit().assume_init();
-            let mut block_header_ptr : NonNull<BlockHeader> = NonNull::new_unchecked(arena.as_mut_ptr().cast());
-            block_header_ptr.as_mut().set_metadata(1024, true, true);
+            let mut block_header_ptr : BlockHeaderPtr = NonNull::new_unchecked(arena.as_mut_ptr().cast());
+            block_header_ptr.as_mut().initialize(1024, true, true, None);
             assert_eq!(1024, block_header_ptr.as_ref().size());
             assert_eq!(block_header_ptr.as_ref().is_last(), true);
             assert_eq!(block_header_ptr.as_ref().is_free(), true);
@@ -584,8 +612,8 @@ mod tests {
         unsafe {
             assert_eq!(tlsf.search_free_block(16), None);
             let mut arena: [MaybeUninit<u8>;1024] = MaybeUninit::uninit().assume_init();
-            let mut block_header_ptr : NonNull<BlockHeader> = NonNull::new_unchecked(arena.as_mut_ptr().cast());
-            block_header_ptr.as_mut().set_metadata(1024, true, true);
+            let mut block_header_ptr : BlockHeaderPtr = NonNull::new_unchecked(arena.as_mut_ptr().cast());
+            block_header_ptr.as_mut().initialize(1024, true, true, None);
             tlsf.insert_free_block(block_header_ptr);
             
             assert_eq!(tlsf.search_free_block(16), Some((6, 0)));
@@ -600,8 +628,8 @@ mod tests {
         unsafe {
             assert_eq!(tlsf.search_free_block(16), None);
             let mut arena: [MaybeUninit<u8>;1024] = MaybeUninit::uninit().assume_init();
-            let mut block_header_ptr : NonNull<BlockHeader> = NonNull::new_unchecked(arena.as_mut_ptr().cast());
-            block_header_ptr.as_mut().set_metadata(1024, true, true);
+            let mut block_header_ptr : BlockHeaderPtr = NonNull::new_unchecked(arena.as_mut_ptr().cast());
+            block_header_ptr.as_mut().initialize(1024, true, true, None);
             tlsf.insert_free_block(block_header_ptr);
             
             assert_eq!(tlsf.search_free_block(16), Some((6, 0)));
@@ -619,15 +647,15 @@ mod tests {
         unsafe {
             assert_eq!(tlsf.search_free_block(16), None);
             let mut arena: [MaybeUninit<u8>;10240] = MaybeUninit::uninit().assume_init();
-            let mut block_header_ptr_0 : NonNull<BlockHeader> = NonNull::new_unchecked(arena.as_mut_ptr().cast());
-            block_header_ptr_0.as_mut().set_metadata(1024, false, true);
+            let mut block_header_ptr_0 : BlockHeaderPtr = NonNull::new_unchecked(arena.as_mut_ptr().cast());
+            block_header_ptr_0.as_mut().initialize(1024, false, true, None);
             tlsf.insert_free_block(block_header_ptr_0);
             
             assert_eq!(tlsf.search_free_block(16), Some((6, 0)));
             assert_eq!(tlsf.search_free_block(1023), Some((6, 0)));
             assert_eq!(tlsf.search_free_block(1024), None);
-            let mut block_header_ptr_1 : NonNull<BlockHeader> = NonNull::new_unchecked(arena.as_mut_ptr().add(1024).cast());
-            block_header_ptr_1.as_mut().set_metadata(1024, true, true);
+            let mut block_header_ptr_1 : BlockHeaderPtr = NonNull::new_unchecked(arena.as_mut_ptr().add(1024).cast());
+            block_header_ptr_1.as_mut().initialize(1024, true, true, None);
             tlsf.insert_free_block(block_header_ptr_1);
             assert_eq!(tlsf.search_free_block(16), Some((6, 0)));
             assert_eq!(tlsf.search_free_block(1023), Some((6, 0)));
@@ -667,7 +695,7 @@ mod tests {
             assert_eq!(tlsf.allocate(16), None);
 
             let mut arena: [MaybeUninit<u8>;1024] = MaybeUninit::uninit().assume_init();
-            let mut block_header_ptr : NonNull<BlockHeader> = NonNull::new_unchecked(arena.as_mut_ptr().cast());
+            let mut block_header_ptr : BlockHeaderPtr = NonNull::new_unchecked(arena.as_mut_ptr().cast());
             tlsf.init_mem_pool(arena.as_mut_ptr().cast(), 1024);
 
             let ptr_0 = tlsf.allocate(128).unwrap();
@@ -689,7 +717,7 @@ mod tests {
             assert_eq!(tlsf.allocate(16), None);
 
             let mut arena: [MaybeUninit<u8>;1024] = MaybeUninit::uninit().assume_init();
-            let mut block_header_ptr : NonNull<BlockHeader> = NonNull::new_unchecked(arena.as_mut_ptr().cast());
+            let mut block_header_ptr : BlockHeaderPtr = NonNull::new_unchecked(arena.as_mut_ptr().cast());
             tlsf.init_mem_pool(arena.as_mut_ptr().cast(), 1024);
 
             let ptr = tlsf.allocate(16);
