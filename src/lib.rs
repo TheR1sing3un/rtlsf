@@ -2,15 +2,24 @@ mod tlsf;
 mod tstlsf;
 mod tctlsf;
 
+pub use tlsf::Tlsf;
+pub use tstlsf::Tstlsf;
+pub use tctlsf::Tctlsf;
+pub use tlsf::MemoryManager;
+pub use tlsf::ThreadSafeMemoryManager;
+pub use tlsf::InmuteableMemoryManager;
+
+#[cfg(test)]
 mod tests {
 
     use crate::{
         tctlsf::Tctlsf, 
         tlsf::ThreadSafeMemoryManager, 
-        tstlsf::Tstlsf
+        tstlsf::Tstlsf, Tlsf
     };
 
     use std::{mem::MaybeUninit, sync::{Arc, Barrier}, time::Instant};
+    use minitrace::{collector::{Config, ConsoleReporter, SpanContext}, flush, Span};
     use rand::{thread_rng, Rng};
 
     const MIN_BLOCK_SIZE: usize = 64;
@@ -18,28 +27,42 @@ mod tests {
     const FLLEN: usize = 26;
     const SLLEN: usize = 4;
     const CONCURRENT_NUM: usize = 8;
-    const LOOP_TIMES: usize = 100_000;     
+    const LOOP_TIMES: usize = 1000_00;
+
+    fn preperation() {
+        // minitrace::set_reporter(ConsoleReporter, Config::default());
+    }
 
     #[test]
-    fn bench_concurrent_allocations() {
-        let dsa = Box::new(Tstlsf::new(FLLEN, SLLEN, MIN_BLOCK_SIZE));
+    fn bench_single_core() {
+        let dsa : Arc<Box<dyn ThreadSafeMemoryManager>>= Arc::new(Box::new(Tstlsf::new(FLLEN, SLLEN, MIN_BLOCK_SIZE)));
+        bench_concurrent(dsa, 1, LOOP_TIMES);
+    }
+
+    #[test]
+    fn bench_concurrent_allocations_1() {
+        let dsa : Arc<Box<dyn ThreadSafeMemoryManager>>= Arc::new(Box::new(Tstlsf::new(FLLEN, SLLEN, MIN_BLOCK_SIZE)));
         bench_concurrent(dsa, CONCURRENT_NUM, LOOP_TIMES);
+        // flush();
     }
 
     #[test]
     fn bench_concurrent_allocations_2() {
-        let dsa = Box::new(Tctlsf::new(MAX_POOL_SIZE, FLLEN, SLLEN, MIN_BLOCK_SIZE, MAX_POOL_SIZE, FLLEN, SLLEN, MIN_BLOCK_SIZE));
-        bench_concurrent(dsa, CONCURRENT_NUM, LOOP_TIMES);
+        let dsa = Tctlsf::new(MAX_POOL_SIZE, FLLEN, SLLEN, MIN_BLOCK_SIZE, MAX_POOL_SIZE, FLLEN, SLLEN, MIN_BLOCK_SIZE);
+        let wrap: Box<dyn ThreadSafeMemoryManager> = Box::new(dsa);
+        let aa : Arc<Box<dyn ThreadSafeMemoryManager>> = Arc::new(wrap);
+        bench_concurrent(aa.clone(), CONCURRENT_NUM, LOOP_TIMES);
+        aa.print_metrics();
     }
 
 
-    fn bench_concurrent(dsa: Box<dyn ThreadSafeMemoryManager>, concurrent_num: usize, loop_times: usize) {
+    pub fn bench_concurrent(dsa: Arc<Box<dyn ThreadSafeMemoryManager>>, concurrent_num: usize, loop_times: usize) {
         unsafe {
             let mut arena: [MaybeUninit<u8>;1 << 18] = MaybeUninit::uninit().assume_init();
 
             dsa.init_mem_pool(arena.as_mut_ptr().cast(), arena.len());
 
-            let shared_tlsf = Arc::new(dsa);
+            let shared_tlsf = dsa;
             let mut handles = Vec::new();
             let barrier = Arc::new(Barrier::new(concurrent_num));
             for t_id in 0..concurrent_num {
@@ -51,7 +74,7 @@ mod tests {
                     let mut fail = 0;
                     clone_barrier.wait();
 
-                        let pre_block = clone_tlsf.allocate(1<<8);
+                        let pre_block = clone_tlsf.allocate(1<<14);
                         if let Some(b) = pre_block {
                             clone_tlsf.deallocate(b);
                         }

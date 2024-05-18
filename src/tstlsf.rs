@@ -1,6 +1,6 @@
-use std::sync::{Arc, Mutex};
+use std::{sync::{Arc, Mutex}, time::Instant};
 
-use crate::tlsf::{BlockHeaderPtr, MemoryManager, ThreadSafeMemoryManager, Tlsf};
+use crate::tlsf::{BlockHeaderPtr, InmuteableMemoryManager, MemoryManager, ThreadSafeMemoryManager, Tlsf};
 
 /**
  * Thread-safe TLSF memory manager
@@ -20,16 +20,27 @@ impl <'a> Tstlsf<'a> {
     }
 }
 
-impl <'a>ThreadSafeMemoryManager for Tstlsf<'a> {
+impl ThreadSafeMemoryManager for Tstlsf<'_> {}
+
+impl <'a>InmuteableMemoryManager for Tstlsf<'a> {
     fn init_mem_pool(&self, mem_pool: *mut u8, mem_pool_size: usize) {
         self.tlsf.lock().unwrap().init_mem_pool(mem_pool, mem_pool_size);
     }
 
     fn allocate(&self, size: usize) -> Option<BlockHeaderPtr> {
-        self.tlsf.lock().unwrap().allocate(size)
+        let id = std::thread::current().id();
+        let timer = Instant::now();
+        let block = self.tlsf.lock().unwrap().allocate(size);
+        let cost = timer.elapsed();
+        // println!("Tstlsf[{:?}] allocate time: {:?}", id, cost);
+        block
     }
 
     fn deallocate(&self, block: BlockHeaderPtr) -> BlockHeaderPtr {
         self.tlsf.lock().unwrap().deallocate(block)
+    }
+
+    fn print_metrics(&self) {
+        
     }
 }

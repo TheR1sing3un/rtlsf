@@ -9,4 +9,18 @@ edition = "2021"
 bitmaps = { version = "3.2.1"}
 rand = {version = "*"}
 hashbrown = "0.14"
-derive_more ={ version = "*"}
+derive_more = { version = "*"}
+minitrace = {version = "*", features = ["enable"]}
+dashmap = "*"
+
+
+[dev-dependencies]
+criterion = { version = "*", features = ["html_reports"] }
+
+[[bench]]
+name = "concurrent-bench"
+harness = false
+
+[[bench]]
+name = "my-bench"
+harness = false

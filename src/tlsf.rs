@@ -1,6 +1,6 @@
 use core::{fmt, ptr::NonNull};
 
-use std::{fmt::Display, rc::Rc};
+use std::{fmt::Display, rc::Rc, thread, time::Instant};
 
 use bitmaps::Bitmap;
 use rand::{thread_rng, Rng};
@@ -33,10 +33,13 @@ pub struct Tlsf<'a> {
 unsafe impl <'a>Send for Tlsf<'a> {}
 unsafe impl <'a>Sync for Tlsf<'a> {}
 
-pub trait ThreadSafeMemoryManager : Send + Sync {
+pub trait ThreadSafeMemoryManager: InmuteableMemoryManager + Send + Sync {}
+
+pub trait InmuteableMemoryManager {
     fn init_mem_pool(&self, mem_pool: *mut u8, mem_pool_size: usize);
     fn allocate(&self, size: usize) -> Option<BlockHeaderPtr>;
     fn deallocate(&self, block: BlockHeaderPtr) -> BlockHeaderPtr;
+    fn print_metrics(&self);
 }
 
 pub trait MemoryManager {
@@ -364,6 +367,8 @@ impl <'a>MemoryManager for Tlsf<'a> {
     }
 
     fn allocate(&mut self, min_size: usize) -> Ptr<BlockHeader> {
+        let timer = Instant::now();
+        let id = thread::current().id();
         let mut size = min_size + core::mem::size_of::<UsedBlockHeader>();
         if size < self.min_block_size {
             size = self.min_block_size;
@@ -419,6 +424,9 @@ impl <'a>MemoryManager for Tlsf<'a> {
                 debug_assert_eq!(need_block.as_ref().block_header.next_block(), split_block);
                 debug_assert_eq!(split_block.unwrap().as_ref().prev_phys_block, Some(need_block.cast()));
             }
+
+            let cost = timer.elapsed();
+            // println!("$$$$$$$$$Tlsf[{:?}] allocate time: {:?}", id, cost);
 
             // return user need block's start address
             return Some(need_block.cast());
@@ -491,6 +499,7 @@ impl <'a>MemoryManager for Tlsf<'a> {
     }
 }
 
+#[cfg(test)]
 mod tests {
 
     use std::mem::MaybeUninit;
