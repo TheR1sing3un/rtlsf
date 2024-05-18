@@ -452,9 +452,8 @@ impl <'a>MemoryManager for Tlsf<'a> {
             // Check if next block is free or not, if free, merge them and update the next block's next block's prev_phys_block
             if let Some(next_phys_block)  = new_block.as_ref().next_block() {
 
-                debug_assert!(next_phys_block.as_ref().is_valid());
-
                 if self.merge_permit(next_phys_block) {
+                    debug_assert!(next_phys_block.as_ref().is_valid());
                     need_update_next_block = next_phys_block.as_ref().next_block();
 
                     // remove next free block from list
@@ -470,9 +469,8 @@ impl <'a>MemoryManager for Tlsf<'a> {
             // Check if previous block is free or not, if free, merge them
             if let Some(prev_phys_block) = block.as_ref().get_prev_phys_block() {
 
-                debug_assert!(prev_phys_block.as_ref().is_valid());
-
                 if self.merge_permit(prev_phys_block) {
+                    debug_assert!(prev_phys_block.as_ref().is_valid());
                     new_size += prev_phys_block.as_ref().size();
                     new_prev_phys_block = prev_phys_block.as_ref().get_prev_phys_block();
                     new_block = prev_phys_block;

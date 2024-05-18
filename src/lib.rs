@@ -27,7 +27,7 @@ mod tests {
     const FLLEN: usize = 26;
     const SLLEN: usize = 4;
     const CONCURRENT_NUM: usize = 8;
-    const LOOP_TIMES: usize = 1000_00;
+    const LOOP_TIMES: usize = 1000_000;
 
     fn preperation() {
         // minitrace::set_reporter(ConsoleReporter, Config::default());

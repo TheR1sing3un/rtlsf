@@ -1,8 +1,8 @@
-use std::{borrow::BorrowMut, cell::RefCell, iter::Once, sync::{atomic::AtomicU64, Arc, Mutex}, thread::{self, sleep, ThreadId}, time::{Duration, Instant}};
+use std::{cell::RefCell, rc::Rc, sync::{atomic::AtomicU64, Arc, Mutex}, thread::{self, ThreadId}, time::Instant};
 use std::sync::atomic::Ordering;
-use dashmap::DashMap;
-use hashbrown::{HashMap, HashSet};
-use crate::tlsf::{self, BlockHeaderPtr, InmuteableMemoryManager, MemoryManager, ThreadSafeMemoryManager, Tlsf};
+
+use hashbrown::HashSet;
+use crate::tlsf::{BlockHeader, BlockHeaderPtr, InmuteableMemoryManager, MemoryManager, ThreadSafeMemoryManager, Tlsf};
 
 
 const DEFAULT_TMP_MAX_SIZE: usize = 1 << 20;
@@ -94,9 +94,6 @@ impl <'a>Tctlsf<'a> {
 
 }
 
-unsafe impl <'a>Send for Tctlsf<'a> {}
-unsafe impl <'a>Sync for Tctlsf<'a> {}
-
 thread_local! {
     static THREAD_LOCAL_A: RefCell<ThreadCacheMemPool<'static>> = RefCell::new(ThreadCacheMemPool::new( DEFAULT_TMP_MAX_SIZE, DEFAULT_TMP_FL_LEN, DEFAULT_TMP_SL_LEN, DEFAULT_TMP_MIN_BLOCK_SIZE));
 }
@@ -131,7 +128,7 @@ impl <'a>InmuteableMemoryManager for Tctlsf<'a> {
             }
 
             // Add block to block_set
-            pool.borrow().add_block_to_set(block.unwrap());
+            pool.borrow().insert_block_to_set(block.unwrap());
             // println!("]]]]]]]]]]]]TC-Tlsf[{:?}]: Cache miss, cost: {}", thread_id, timer.elapsed().as_nanos());
             block
         });
@@ -155,29 +152,33 @@ impl <'a>InmuteableMemoryManager for Tctlsf<'a> {
 
 }
 
-struct Helper {
-    block_set: HashSet<BlockHeaderPtr>,
+struct BlockMergeHelper {
+    block_set: RefCell<HashSet<BlockHeaderPtr>>,
 }
 
-impl Helper {
-
+impl BlockMergeHelper {
     pub fn new(block_set: HashSet<BlockHeaderPtr>) -> Self {
         Self {
-            block_set,
+            block_set: RefCell::new(block_set),
         }
     }
 
     // Only merge the block that this block is holded by this thread cache memory pool
     // And the block should be valid and free
-    pub fn merge_permit(&self, block: BlockHeaderPtr) -> bool {
+    fn merge_permit(&self, block: BlockHeaderPtr) -> bool {
         unsafe {
-            self.block_set.contains(&block) && block.as_ref().is_valid() && block.as_ref().is_free()
+            self.block_set.borrow().contains(&block) && block.as_ref().is_valid() && block.as_ref().is_free()
         }
     }
-}
 
-unsafe impl Send for Helper {}
-unsafe impl Sync for Helper {}
+    fn insert_block_to_set(&self, block: BlockHeaderPtr) {
+        self.block_set.borrow_mut().insert(block);
+    }
+
+    fn remove_block_from_set(&self, block: &BlockHeaderPtr) {
+        self.block_set.borrow_mut().remove(block);
+    }
+}
 
 pub struct ThreadCacheMemPool<'a> {
     thread_id: ThreadId,
@@ -189,7 +190,8 @@ pub struct ThreadCacheMemPool<'a> {
     min_block_size: usize,
 
     tlsf: RefCell<Tlsf<'a>>,
-    helper: Arc<Mutex<Helper>>,
+    /* Helper helps cache to determine if deallocated block's neighbor should be merged */
+    block_merge_helper: Rc<BlockMergeHelper>,
 
     /* Holded blocks' total size and total num record */
     holded_blocks_size: usize,
@@ -203,13 +205,15 @@ pub struct ThreadCacheMemPool<'a> {
 impl <'a>ThreadCacheMemPool<'a> {
     pub fn new(max_size: usize, fl_len: usize, sl_len: usize, min_block_size: usize) -> Self {
         let mut tlsf = Tlsf::new(fl_len, sl_len, min_block_size);
-        let helper = Helper::new(HashSet::new());
-        let wrap_helper = Arc::new(Mutex::new(helper));
-        let cloned_func = wrap_helper.clone();
-        tlsf.register_merge_func(Box::new(move |block | {
-            cloned_func.lock().unwrap().merge_permit(block)
-        }));
         let thread_id = thread::current().id();
+        let helper = Rc::new(BlockMergeHelper::new(HashSet::new()));
+        let clone_helper = helper.clone();
+
+        // Register merge function, only merge the block that this block is holded by this thread cache memory pool
+        tlsf.register_merge_func(Box::new(move |block| {
+            clone_helper.merge_permit(block)
+        }));
+
         let pool = Self {
             thread_id,
             max_size,
@@ -217,7 +221,7 @@ impl <'a>ThreadCacheMemPool<'a> {
             sl_len,
             min_block_size,
             tlsf: RefCell::new(tlsf),
-            helper: wrap_helper,
+            block_merge_helper: helper,
             holded_blocks_size: 0,
             holded_blocks_num: 0,
             free_blocks_size: 0,
@@ -226,9 +230,14 @@ impl <'a>ThreadCacheMemPool<'a> {
         pool
     }
 
-    pub fn add_block_to_set(&self, block: BlockHeaderPtr) {
-        self.helper.lock().unwrap().block_set.insert(block);
+    fn insert_block_to_set(&self, block: BlockHeaderPtr) {
+        self.block_merge_helper.insert_block_to_set(block);
     }
+
+    fn remove_block_from_set(&self, block: &BlockHeaderPtr) {
+        self.block_merge_helper.remove_block_from_set(block);
+    }
+
     
 }
 
@@ -253,21 +262,20 @@ impl <'a>InmuteableMemoryManager for ThreadCacheMemPool<'a> {
         unsafe {
             let next_block = block.as_ref().next_block();
             let new_block = self.tlsf.borrow_mut().deallocate(block);
-            let mut helper = self.helper.lock().unwrap();
             if new_block != block {
                 // The block has merged with previous block
                 // Remove deallocated block from block_set
-                helper.block_set.remove(&block);
+                self.remove_block_from_set(&block);
             }
 
             if next_block.is_some() && next_block != new_block.as_ref().next_block() {
                 // The block has merged with next block
                 // Remove original next block from block_set
-                helper.block_set.remove(&next_block.unwrap());
+                self.remove_block_from_set(&next_block.unwrap());
             }
 
             // Add new block to block_set
-            helper.block_set.insert(new_block);
+            self.insert_block_to_set(new_block);
             new_block
         }
     }
