@@ -39,8 +39,4 @@ impl <'a>InmuteableMemoryManager for Tstlsf<'a> {
     fn deallocate(&self, block: BlockHeaderPtr) -> BlockHeaderPtr {
         self.tlsf.lock().unwrap().deallocate(block)
     }
-
-    fn print_metrics(&self) {
-        
-    }
 }

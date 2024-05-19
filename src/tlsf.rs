@@ -1,6 +1,7 @@
 use core::{fmt, ptr::NonNull};
 
 use std::{fmt::Display, rc::Rc, thread, time::Instant};
+use log::{debug, info, log};
 
 use bitmaps::Bitmap;
 use rand::{thread_rng, Rng};
@@ -39,7 +40,6 @@ pub trait InmuteableMemoryManager {
     fn init_mem_pool(&self, mem_pool: *mut u8, mem_pool_size: usize);
     fn allocate(&self, size: usize) -> Option<BlockHeaderPtr>;
     fn deallocate(&self, block: BlockHeaderPtr) -> BlockHeaderPtr;
-    fn print_metrics(&self);
 }
 
 pub trait MemoryManager {
@@ -312,7 +312,7 @@ impl <'a>Tlsf<'a> {
         }
     }
 
-    fn remove_free_block(&mut self, block_header: BlockHeaderPtr) {
+    pub fn remove_free_block(&mut self, block_header: BlockHeaderPtr) {
         unsafe {
             let size = block_header.as_ref().size();
             let (fl, sl) = self.map_search(size).unwrap();
@@ -407,6 +407,8 @@ impl <'a>MemoryManager for Tlsf<'a> {
                 if let Some(mut next_phys_block) = next_phys_block {
                     next_phys_block.as_mut().set_prev_phys_block(Some(new_block));
                 }
+
+                debug!("Tlsf[{:?}]: Split a block with size: {:?}B", id, block_size - size);
             }
             let mut need_block = block.cast::<UsedBlockHeader>();
             debug_assert!(need_block_size > 0);
@@ -426,7 +428,9 @@ impl <'a>MemoryManager for Tlsf<'a> {
             }
 
             let cost = timer.elapsed();
-            // println!("$$$$$$$$$Tlsf[{:?}] allocate time: {:?}", id, cost);
+            
+            info!("Tlsf[{:?}]: Allocate min size: {:?}B, real block's size: {:?}B, cost time: {:?}",
+                id, size, need_block_size, cost);
 
             // return user need block's start address
             return Some(need_block.cast());
@@ -435,6 +439,9 @@ impl <'a>MemoryManager for Tlsf<'a> {
 
     fn deallocate(&mut self, block: BlockHeaderPtr) -> BlockHeaderPtr /* after-merge block */ {
         unsafe {
+            let thread_id = thread::current().id();
+            let timer = Instant::now();
+            let address = block.as_ptr() as usize;
             let mut new_block = block;
             let mut new_size = block.as_ref().size();
             let mut new_prev_phys_block = block.as_ref().get_prev_phys_block();
@@ -461,6 +468,9 @@ impl <'a>MemoryManager for Tlsf<'a> {
                     // merge the next free block and this free block
                     new_size += next_phys_block.as_ref().size();
                     new_last = next_phys_block.as_ref().is_last();
+                    
+                    debug!("Tlsf[{:?}]: Deallocate block[{:?}] and merge next block[{:?}], new size: {:?}B", thread_id, address, next_phys_block.as_ptr() as usize, new_size);
+
                 } else {
                     need_update_next_block = Some(next_phys_block);
                 }
@@ -476,6 +486,8 @@ impl <'a>MemoryManager for Tlsf<'a> {
                     new_block = prev_phys_block;
                     // remove previous free block from list
                     self.remove_free_block(prev_phys_block);
+
+                    debug!("Tlsf[{:?}]: Deallocate block[{:?}] and merge previous block[{:?}], new size: {:?}B",    thread_id, address, prev_phys_block.as_ptr() as usize, new_size);
                 }
             }
 
@@ -492,6 +504,10 @@ impl <'a>MemoryManager for Tlsf<'a> {
 
             // insert deallocated block to free list
             self.insert_free_block(new_block);
+
+            let cost = timer.elapsed();
+            info!("Tlsf[{:?}]: Deallocate block[{:?}], new block[{:?}], cost time: {:?}", thread_id, address,
+                new_block.as_ptr() as usize, cost);
             new_block
         }
     }
@@ -516,14 +532,12 @@ mod tests {
         assert_eq!(size_of::<BlockHeader>(), 24);
         assert_eq!(size_of::<FreeBlockHeader>(), 40);
         assert_eq!(size_of::<UsedBlockHeader>(), 24);
-        println!("{:?}", block_header);
     }
 
 
     #[test]
     fn test_tlsf_new() {
         let tlsf = Tlsf::new(28, 4, 16);
-        // println!("{:?}", tlsf);
     }
 
     #[test]

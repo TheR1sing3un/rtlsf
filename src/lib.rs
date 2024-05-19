@@ -30,17 +30,19 @@ mod tests {
     const LOOP_TIMES: usize = 1000_000;
 
     fn preperation() {
-        // minitrace::set_reporter(ConsoleReporter, Config::default());
+        env_logger::builder().filter_level(log::LevelFilter::Warn).init();
     }
 
     #[test]
     fn bench_single_core() {
+        preperation();
         let dsa : Arc<Box<dyn ThreadSafeMemoryManager>>= Arc::new(Box::new(Tstlsf::new(FLLEN, SLLEN, MIN_BLOCK_SIZE)));
         bench_concurrent(dsa, 1, LOOP_TIMES);
     }
 
     #[test]
     fn bench_concurrent_allocations_1() {
+        preperation();
         let dsa : Arc<Box<dyn ThreadSafeMemoryManager>>= Arc::new(Box::new(Tstlsf::new(FLLEN, SLLEN, MIN_BLOCK_SIZE)));
         bench_concurrent(dsa, CONCURRENT_NUM, LOOP_TIMES);
         // flush();
@@ -48,11 +50,11 @@ mod tests {
 
     #[test]
     fn bench_concurrent_allocations_2() {
+        preperation();
         let dsa = Tctlsf::new(MAX_POOL_SIZE, FLLEN, SLLEN, MIN_BLOCK_SIZE, MAX_POOL_SIZE, FLLEN, SLLEN, MIN_BLOCK_SIZE);
         let wrap: Box<dyn ThreadSafeMemoryManager> = Box::new(dsa);
         let aa : Arc<Box<dyn ThreadSafeMemoryManager>> = Arc::new(wrap);
         bench_concurrent(aa.clone(), CONCURRENT_NUM, LOOP_TIMES);
-        aa.print_metrics();
     }
 
 
@@ -65,7 +67,11 @@ mod tests {
             let shared_tlsf = dsa;
             let mut handles = Vec::new();
             let barrier = Arc::new(Barrier::new(concurrent_num));
+            let core_ids = core_affinity::get_core_ids().unwrap();
+            println!("Core ids: {:?}", core_ids);
             for t_id in 0..concurrent_num {
+                let core = core_ids[t_id % core_ids.len()];
+                core_affinity::set_for_current(core);
                 let clone_tlsf = shared_tlsf.clone();
                 let clone_barrier = barrier.clone();
                 let handle = std::thread::spawn(move || {
@@ -96,9 +102,9 @@ mod tests {
                         let elapsed = start.elapsed();
                         total_time_ns += elapsed.as_nanos();
                     }
-                    println!("Thread {} finished in {} ns, success: {}, fail: {}", t_id, total_time_ns, success, fail);
+                    println!("Thread {:?} finished in {} ns, success: {}, fail: {}", t_id, total_time_ns, success, fail);
                     // print avg time for each allocation
-                    println!("Thread {} avg time: {} ns", t_id, total_time_ns / loop_times as u128);
+                    println!("Thread {:?} avg time: {} ns", t_id, total_time_ns / loop_times as u128);
                 });
                 handles.push(handle);
             }

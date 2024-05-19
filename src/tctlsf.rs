@@ -2,6 +2,7 @@ use std::{cell::RefCell, rc::Rc, sync::{atomic::AtomicU64, Arc, Mutex}, thread::
 use std::sync::atomic::Ordering;
 
 use hashbrown::HashSet;
+use log::{debug, info};
 use crate::tlsf::{BlockHeader, BlockHeaderPtr, InmuteableMemoryManager, MemoryManager, ThreadSafeMemoryManager, Tlsf};
 
 
@@ -73,9 +74,7 @@ impl <'a>Tctlsf<'a> {
     }
 
     fn cache_hit_add(&self, count: u64) {
-        let timer = Instant::now();
         self.cache_hit_count.fetch_add(count, Ordering::SeqCst);
-        // println!("Cache hit add cost: {}ns", timer.elapsed().as_nanos());
     }
 
     fn cache_miss_add(&self, count: u64) {
@@ -110,14 +109,15 @@ impl <'a>InmuteableMemoryManager for Tctlsf<'a> {
     fn allocate(&self, size: usize) -> Option<BlockHeaderPtr> {
         let curr_thread = thread::current();
         let timer = Instant::now();
-        // println!("[[[[[[[[[[[[[[TC-Tlsf[{:?}]: Allocate from thread cache memory pool start", curr_thread.id());
         let thread_id = curr_thread.id();
         let block = THREAD_LOCAL_A.with(|pool| {
             // Allocate from thread memory pool
             let mut block = pool.borrow().allocate(size);
             if block.is_some() {
                 self.cache_hit_add(1);
-                // println!("*********TC-Tlsf[{:?}]: Cache hit, cost: {}ns", thread_id, timer.elapsed().as_nanos());
+                unsafe {
+                    info!("Tctlsf[{:?}]: Allocate from cache, allocate min size: {:?}B, real block's size: {:?}B, cost time: {:?}", thread_id, size, block.unwrap().as_ref().size(), timer.elapsed().as_nanos());
+                }
                 return block;
             }
             // Allocate from core memory pool
@@ -127,9 +127,12 @@ impl <'a>InmuteableMemoryManager for Tctlsf<'a> {
                 return None;
             }
 
-            // Add block to block_set
-            pool.borrow().insert_block_to_set(block.unwrap());
-            // println!("]]]]]]]]]]]]TC-Tlsf[{:?}]: Cache miss, cost: {}", thread_id, timer.elapsed().as_nanos());
+            // Add this block to thread memory pool for hold
+            pool.borrow().hold_block(block.unwrap());
+            
+            unsafe {
+                info!("Tctlsf[{:?}]: Allocate from core, allocate min size: {:?}B, real block's size: {:?}B, cost time: {:?}", thread_id, size, block.unwrap().as_ref().size(), timer.elapsed().as_nanos());
+            }
             block
         });
         block
@@ -139,27 +142,51 @@ impl <'a>InmuteableMemoryManager for Tctlsf<'a> {
         let curr_thread = thread::current();
         let thread_id = curr_thread.id();
 
-        THREAD_LOCAL_A.with(|pool| {
+        let blcok = THREAD_LOCAL_A.with(|pool| {
             let new_block = pool.borrow().deallocate(block);
-            // TODO: When we back the blocks from thread memory pool to core memory pool?
-            new_block
-        })
-    }
 
-    fn print_metrics(&self) {
-        // println!("Cache hit rate: {}", self.cache_hit_rate());
+            // After deallocation, we should check if we should take back some blocks from thread memory pool to core memory pool
+            if pool.borrow().dehold_check() {
+                // Dehold it from thread memory pool
+                pool.borrow().dehold(new_block);
+                // Deallocate it from core memory pool
+                {
+                    let mut core_mem_pool = self.core_mem_pool.lock().unwrap();
+                    // TODO: Deal with core pool merge the blocks which are holded by thread memory pool
+                    core_mem_pool.deallocate(new_block);
+                }
+            }
+
+            block
+        });
+
+        blcok
     }
 
 }
 
 struct BlockMergeHelper {
+    id: ThreadId,
     block_set: RefCell<HashSet<BlockHeaderPtr>>,
+    
+    /* Free blocks' total size and total num record */ 
+    free_blocks_size: RefCell<usize>,
+    free_blocks_num: RefCell<usize>,
+
+     /* Holded blocks' total size and total num record */
+    holded_blocks_size: RefCell<usize>,
+    holded_blocks_num: RefCell<usize>,
 }
 
 impl BlockMergeHelper {
-    pub fn new(block_set: HashSet<BlockHeaderPtr>) -> Self {
+    pub fn new(id: ThreadId) -> Self {
         Self {
-            block_set: RefCell::new(block_set),
+            id,
+            block_set: RefCell::new(HashSet::new()),
+            free_blocks_size: RefCell::new(0),
+            free_blocks_num: RefCell::new(0),
+            holded_blocks_size: RefCell::new(0),
+            holded_blocks_num: RefCell::new(0),
         }
     }
 
@@ -178,6 +205,59 @@ impl BlockMergeHelper {
     fn remove_block_from_set(&self, block: &BlockHeaderPtr) {
         self.block_set.borrow_mut().remove(block);
     }
+
+    fn hold_block(&self, block: BlockHeaderPtr) {
+        unsafe {
+            let size = block.as_ref().size();
+            *self.holded_blocks_size.borrow_mut() += size;
+            *self.holded_blocks_num.borrow_mut() += 1;
+            self.insert_block_to_set(block);
+            debug!("BlockMergeHelper[{:?}]: Hold a block[{:?}], size: {:?}B", self.id, block.as_ptr() as usize, size);
+        }
+    }
+
+    fn add_free_block(&self, num: usize, size: usize) {
+        *self.free_blocks_size.borrow_mut() += size;
+        *self.free_blocks_num.borrow_mut() += num;
+    }
+
+    fn remove_free_block(&self, num: usize, size: usize) {
+        *self.free_blocks_size.borrow_mut() -= size;
+        *self.free_blocks_num.borrow_mut() -= num;
+    }
+     fn remove_merged_block(&self, size: usize) {
+        *self.free_blocks_size.borrow_mut() -= size;
+        *self.free_blocks_num.borrow_mut() -= 1;
+        *self.holded_blocks_num.borrow_mut() -= 1;
+    }
+    fn dehold_block(&self, block: BlockHeaderPtr) {
+        unsafe {
+            let size = block.as_ref().size();
+            *self.holded_blocks_size.borrow_mut() -= size;
+            *self.holded_blocks_num.borrow_mut() -= 1;
+            *self.free_blocks_num.borrow_mut() -= 1;
+            *self.free_blocks_size.borrow_mut() -= size;
+            self.remove_block_from_set(&block);
+            debug!("BlockMergeHelper[{:?}]: Dehold a block[{:?}], size: {:?}B", self.id, block.as_ptr() as usize, size);
+        }
+    }
+
+    fn free_blocks_size(&self) -> usize {
+        *self.free_blocks_size.borrow()
+    }
+
+    fn free_blocks_num(&self) -> usize {
+        *self.free_blocks_num.borrow()
+    }
+
+    fn holded_blocks_size(&self) -> usize {
+        *self.holded_blocks_size.borrow()
+    }
+
+    fn holded_blocks_num(&self) -> usize {
+        *self.holded_blocks_num.borrow()
+    }
+
 }
 
 pub struct ThreadCacheMemPool<'a> {
@@ -192,21 +272,13 @@ pub struct ThreadCacheMemPool<'a> {
     tlsf: RefCell<Tlsf<'a>>,
     /* Helper helps cache to determine if deallocated block's neighbor should be merged */
     block_merge_helper: Rc<BlockMergeHelper>,
-
-    /* Holded blocks' total size and total num record */
-    holded_blocks_size: usize,
-    holded_blocks_num: usize,
-
-    /* Free blocks' total size and total num record */
-    free_blocks_size: usize,
-    free_blocks_num: usize,
 }
 
 impl <'a>ThreadCacheMemPool<'a> {
     pub fn new(max_size: usize, fl_len: usize, sl_len: usize, min_block_size: usize) -> Self {
         let mut tlsf = Tlsf::new(fl_len, sl_len, min_block_size);
         let thread_id = thread::current().id();
-        let helper = Rc::new(BlockMergeHelper::new(HashSet::new()));
+        let helper = Rc::new(BlockMergeHelper::new(thread_id));
         let clone_helper = helper.clone();
 
         // Register merge function, only merge the block that this block is holded by this thread cache memory pool
@@ -222,12 +294,12 @@ impl <'a>ThreadCacheMemPool<'a> {
             min_block_size,
             tlsf: RefCell::new(tlsf),
             block_merge_helper: helper,
-            holded_blocks_size: 0,
-            holded_blocks_num: 0,
-            free_blocks_size: 0,
-            free_blocks_num: 0,
         };
         pool
+    }
+
+    fn hold_block(&self, block: BlockHeaderPtr) {
+        self.block_merge_helper.hold_block(block);
     }
 
     fn insert_block_to_set(&self, block: BlockHeaderPtr) {
@@ -237,7 +309,20 @@ impl <'a>ThreadCacheMemPool<'a> {
     fn remove_block_from_set(&self, block: &BlockHeaderPtr) {
         self.block_merge_helper.remove_block_from_set(block);
     }
+    /**
+     * Determine if we should dehold some blocks from thread memory pool to core memory pool
+     * (1) If the free blocks' total size is larger than thread memory pool's max size
+     */
+    fn dehold_check(&self) -> bool {
+        self.block_merge_helper.holded_blocks_size() > self.max_size
+    }
 
+    fn dehold(&self, block: BlockHeaderPtr) {
+        // Remove it from tlsf
+        self.tlsf.borrow_mut().remove_free_block(block);
+        // Dehold it
+        self.block_merge_helper.dehold_block(block);
+    }
     
 }
 
@@ -250,39 +335,56 @@ impl <'a>InmuteableMemoryManager for ThreadCacheMemPool<'a> {
 
     fn allocate(&self, size: usize) -> Option<BlockHeaderPtr> {
         let timer = Instant::now();
-        // println!("<<<<<<<<<<<<<<ThreadCache[{:?}]: Allocate from thread memory pool start", self.thread_id);
         let mut tlsf = self.tlsf.borrow_mut();
-        // println!("*********ThreadCache[{:?}]: Get cache lock cost: {}", self.thread_id, timer.elapsed().as_nanos());
+        // TODO: Deal with splited block's index in cache
         let block = tlsf.allocate(size);
-        // println!(">>>>>>>>>>>>>>ThreadCache[{:?}]: Allocate {:?}, cost: {}", self.thread_id, block.is_some(), timer.elapsed().as_nanos());
+        let cost = timer.elapsed().as_nanos();
+        if let Some(b) = block {
+            // Update free blocks' total size and total num record
+            unsafe {
+                self.block_merge_helper.remove_free_block(1, b.as_ref().size());
+            }
+            unsafe {
+                info!("ThreadCache[{:?}]: Allocate min size: {:?}B, real block's size: {:?}B, cost time: {:?}", self.thread_id, size, b.as_ref().size(), cost);
+            }
+        } else {
+            info!("ThreadCache[{:?}]: Allocate min size: {:?}B, real block's size: None, cost time: {:?}", self.thread_id, size, cost);
+        }
         block
     }
 
     fn deallocate(&self, block: BlockHeaderPtr) -> BlockHeaderPtr {
         unsafe {
+            let timer = Instant::now();
+            let address = block.as_ptr() as usize;
             let next_block = block.as_ref().next_block();
+            let prev_block = block.as_ref().prev_phys_block;
             let new_block = self.tlsf.borrow_mut().deallocate(block);
             if new_block != block {
                 // The block has merged with previous block
                 // Remove deallocated block from block_set
                 self.remove_block_from_set(&block);
+                // Remove prev block from free blocks' total size and total num record
+                self.block_merge_helper.remove_merged_block(prev_block.unwrap().as_ref().size());
+
             }
 
             if next_block.is_some() && next_block != new_block.as_ref().next_block() {
                 // The block has merged with next block
                 // Remove original next block from block_set
                 self.remove_block_from_set(&next_block.unwrap());
+                // Remove original next block from free blocks' total size and total num record
+                self.block_merge_helper.remove_merged_block(next_block.unwrap().as_ref().size());
             }
 
             // Add new block to block_set
             self.insert_block_to_set(new_block);
+            self.block_merge_helper.add_free_block(1, new_block.as_ref().size());
+            let cost = timer.elapsed().as_nanos();
+            info!("ThreadCache[{:?}]: Deallocate block[{:?}], new block[{:?}], cost time: {:?}", self.thread_id, address, new_block.as_ptr() as usize, cost);
+
             new_block
         }
-    }
-
-    fn print_metrics(&self) {
-        println!("Holded blocks size: {}, Holded blocks num: {}", self.holded_blocks_size, self.holded_blocks_num);
-        println!("Free blocks size: {}, Free blocks num: {}", self.free_blocks_size, self.free_blocks_num);
     }
 }
 

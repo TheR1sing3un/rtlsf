@@ -12,10 +12,14 @@ hashbrown = "0.14"
 derive_more = { version = "*"}
 minitrace = {version = "*", features = ["enable"]}
 dashmap = "*"
+log = "0.4.21"
+env_logger = "0.11.3"
 
 
 [dev-dependencies]
+core_affinity = "0.8.1"
 criterion = { version = "*", features = ["html_reports"] }
+libc = "0.2"
 
 [[bench]]
 name = "concurrent-bench"
