@@ -1,3 +1,5 @@
+#![feature(thread_id_value)]
+
 mod tlsf;
 mod tstlsf;
 mod tctlsf;
@@ -15,7 +17,7 @@ mod tests {
     use crate::{
         tctlsf::Tctlsf, 
         tlsf::ThreadSafeMemoryManager, 
-        tstlsf::Tstlsf, Tlsf
+        tstlsf::Tstlsf
     };
 
     use std::{mem::MaybeUninit, sync::{Arc, Barrier}, time::Instant};
@@ -30,7 +32,7 @@ mod tests {
     const LOOP_TIMES: usize = 1000_000;
 
     fn preperation() {
-        env_logger::builder().filter_level(log::LevelFilter::Warn).init();
+        // env_logger::builder().filter_level(log::LevelFilter::Warn).init();
     }
 
     #[test]
@@ -45,7 +47,7 @@ mod tests {
         preperation();
         let dsa : Arc<Box<dyn ThreadSafeMemoryManager>>= Arc::new(Box::new(Tstlsf::new(FLLEN, SLLEN, MIN_BLOCK_SIZE)));
         bench_concurrent(dsa, CONCURRENT_NUM, LOOP_TIMES);
-        // flush();
+
     }
 
     #[test]
@@ -55,6 +57,7 @@ mod tests {
         let wrap: Box<dyn ThreadSafeMemoryManager> = Box::new(dsa);
         let aa : Arc<Box<dyn ThreadSafeMemoryManager>> = Arc::new(wrap);
         bench_concurrent(aa.clone(), CONCURRENT_NUM, LOOP_TIMES);
+
     }
 
 
@@ -75,21 +78,15 @@ mod tests {
                 let clone_tlsf = shared_tlsf.clone();
                 let clone_barrier = barrier.clone();
                 let handle = std::thread::spawn(move || {
-                    let mut total_time_ns = 0;
                     let mut success = 0;
                     let mut fail = 0;
+                    let start = Instant::now();
                     clone_barrier.wait();
 
-                        let pre_block = clone_tlsf.allocate(1<<14);
-                        if let Some(b) = pre_block {
-                            clone_tlsf.deallocate(b);
-                        }
-
                     for _ in 0..loop_times {
-                        let start = Instant::now();
                         let size : usize = thread_rng().gen_range(64..1<<8) as usize;
                         let block = clone_tlsf.allocate(size);
-                        if let Some(b) = block {
+                        if let Some((b, _)) = block {
                             // verify the block
                             debug_assert!(b.as_ref().is_valid());
                             debug_assert!(b.as_ref().size() >= size);
@@ -99,9 +96,8 @@ mod tests {
                         } else {
                             fail += 1;
                         }
-                        let elapsed = start.elapsed();
-                        total_time_ns += elapsed.as_nanos();
                     }
+                    let total_time_ns = start.elapsed().as_nanos();
                     println!("Thread {:?} finished in {} ns, success: {}, fail: {}", t_id, total_time_ns, success, fail);
                     // print avg time for each allocation
                     println!("Thread {:?} avg time: {} ns", t_id, total_time_ns / loop_times as u128);

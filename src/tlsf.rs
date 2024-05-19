@@ -4,7 +4,6 @@ use std::{fmt::Display, rc::Rc, thread, time::Instant};
 use log::{debug, info, log};
 
 use bitmaps::Bitmap;
-use rand::{thread_rng, Rng};
 
 pub type Ptr<T> = Option<NonNull<T>>;
 
@@ -12,12 +11,12 @@ pub type BlockHeaderPtr = NonNull<BlockHeader>;
 
 const DEFAULT_BIT_MAP_LEN: usize = 32;
 
-const BLOCK_MAGIC_NUMBER: usize = 0x1955938454;
+const BLOCK_MAGIC_NUMBER: u32 = 0x006C6379;
 
+pub struct Tlsf {
+    /* Unique id */
+    id: usize,
 
-pub type MergeFunc<'a> = Box<dyn Fn(BlockHeaderPtr) -> bool + 'a>;
-
-pub struct Tlsf<'a> {
     fl_len: usize,
     sl_len: usize,
     min_block_size: usize,
@@ -27,25 +26,23 @@ pub struct Tlsf<'a> {
     fl_bitmap: Bitmap<DEFAULT_BIT_MAP_LEN>,
     sl_bitmap: Vec<Bitmap<DEFAULT_BIT_MAP_LEN>>,
     free_list_headers: Vec<Vec<Ptr<FreeBlockHeader>>>,
-    merge_func: Option<MergeFunc<'a>>,
-    rand: usize,
 }
 
-unsafe impl <'a>Send for Tlsf<'a> {}
-unsafe impl <'a>Sync for Tlsf<'a> {}
+unsafe impl Send for Tlsf {}
+unsafe impl Sync for Tlsf {}
 
 pub trait ThreadSafeMemoryManager: InmuteableMemoryManager + Send + Sync {}
 
 pub trait InmuteableMemoryManager {
     fn init_mem_pool(&self, mem_pool: *mut u8, mem_pool_size: usize);
-    fn allocate(&self, size: usize) -> Option<BlockHeaderPtr>;
-    fn deallocate(&self, block: BlockHeaderPtr) -> BlockHeaderPtr;
+    fn allocate(&self, size: usize) -> Option<(BlockHeaderPtr, bool/* split */)>;
+    fn deallocate(&self, block: BlockHeaderPtr) -> BlockHeaderPtr/* after merged new block */;
 }
 
 pub trait MemoryManager {
     fn init_mem_pool(&mut self, addr: *mut u8, size: usize);
-    fn allocate(&mut self, size: usize) -> Ptr<BlockHeader>;
-    fn deallocate(&mut self, block: BlockHeaderPtr) -> BlockHeaderPtr;
+    fn allocate(&mut self, size: usize) -> Option<(BlockHeaderPtr, bool/* split */)>;
+    fn deallocate(&mut self, block: BlockHeaderPtr) -> BlockHeaderPtr/* after merged new block */;
 }
 
 /// The common header of a block.
@@ -53,15 +50,17 @@ pub trait MemoryManager {
 /// The first flag [F] indicates whether the block is free or not.
 /// The second flag [L] indicates whether this block is the last block of the memory pool.
 /// [size;L;F]
+/// magic: 64-bit magic number, high 32-bit is magic number, low 32-bit is the holder's id of this block
 #[derive(Debug)]
 pub struct BlockHeader {
-    pub magic: usize,
+    pub magic: u32,
+    pub holder_id: u32,
     pub metadata: usize,
     pub prev_phys_block: Ptr<BlockHeader>
 }
 
 impl BlockHeader {
-    pub fn new(size: usize, last: bool, free: bool, prev_phys_block: Ptr<BlockHeader>) -> Self {
+    pub fn new(holder_id: usize, size: usize, last: bool, free: bool, prev_phys_block: Ptr<BlockHeader>) -> Self {
         let mut metadata = size << 2;
         if last {
             metadata |= 0b10;
@@ -71,6 +70,7 @@ impl BlockHeader {
         }
         Self {
             magic: BLOCK_MAGIC_NUMBER,
+            holder_id: holder_id as u32,
             metadata,
             prev_phys_block
         }
@@ -90,6 +90,10 @@ impl BlockHeader {
 
     fn get_prev_phys_block(&self) -> Ptr<BlockHeader> {
         self.prev_phys_block
+    }
+
+    fn holder_id(&self) -> usize {
+        self.holder_id as usize
     }
 
     fn set_prev_phys_block(&mut self, prev_phys_block: Ptr<BlockHeader>) {
@@ -116,10 +120,11 @@ impl BlockHeader {
         self.metadata = (self.metadata & 0b11) | (size << 2);
     }
 
-    pub fn initialize(&mut self, size: usize, last: bool, free: bool, prev_phys_block: Ptr<BlockHeader>) {
+    pub fn initialize(&mut self, holder_id: usize, size: usize, last: bool, free: bool, prev_phys_block: Ptr<BlockHeader>) {
         self.set_metadata(size, last, free);
         self.set_prev_phys_block(prev_phys_block);
         self.set_magic();
+        self.set_holder_id(holder_id);
     }
 
 
@@ -131,6 +136,10 @@ impl BlockHeader {
 
     fn set_magic(&mut self) {
         self.magic = BLOCK_MAGIC_NUMBER;
+    }
+
+    pub fn set_holder_id(&mut self, holder_id: usize) {
+        self.holder_id = holder_id as u32;        
     }
 
     pub fn is_valid(&self) -> bool {
@@ -149,10 +158,10 @@ impl BlockHeader {
     }
 }
 
-fn new_block_from_addr(addr: *mut u8, size: usize, last: bool, free: bool, prev_phys_block: Ptr<BlockHeader>) -> BlockHeaderPtr {
+fn new_block_from_addr(holder_id: usize, addr: *mut u8, size: usize, last: bool, free: bool, prev_phys_block: Ptr<BlockHeader>) -> BlockHeaderPtr {
     let mut block: BlockHeaderPtr = NonNull::new(addr).unwrap().cast();
     unsafe {
-        block.as_mut().initialize(size, last, free, prev_phys_block);
+        block.as_mut().initialize(holder_id, size, last, free, prev_phys_block);
     }
     block.cast()
 }
@@ -173,9 +182,9 @@ struct UsedBlockHeader {
     pub block_header: BlockHeader
 }
 
-impl <'a>Tlsf<'a> {
-    pub fn with_merge_func(fl_len: usize, sl_len: usize, min_block_size: usize,
-        merge_func: Option<MergeFunc<'a>>) -> Self {
+impl Tlsf {
+
+    pub fn new(id: usize, fl_len: usize, sl_len: usize, min_block_size: usize) -> Self {
         let mut sl_bitmap = Vec::with_capacity(fl_len);
         let mut free_list_headers = Vec::with_capacity(fl_len);
         for _ in 0..fl_len {
@@ -189,8 +198,8 @@ impl <'a>Tlsf<'a> {
         let min_block_size_log2 = min_block_size.trailing_zeros() as usize;
         let max_block_size = 1 << (fl_len + min_block_size_log2);
         let sli = sl_len.trailing_zeros() as usize;
-        let rand : usize = thread_rng().gen_range(0..123214798) as usize;
-        let a = Self {
+        Self {
+            id,
             fl_len,
             sl_len,
             min_block_size,
@@ -200,31 +209,6 @@ impl <'a>Tlsf<'a> {
             fl_bitmap: Bitmap::new(),
             sl_bitmap,
             free_list_headers,
-            merge_func,
-            rand
-        };
-        return a;
-    }
-
-    pub fn new(fl_len: usize, sl_len: usize, min_block_size: usize) -> Self {
-        Self::with_merge_func(fl_len, sl_len, min_block_size, Some(Box::new(Self::default_merge_permit)))
-    }
-
-    pub fn register_merge_func(&mut self, merge_func: MergeFunc<'a>) {
-        self.merge_func = Some(merge_func);
-    }
-
-    fn merge_permit(&self, block: BlockHeaderPtr) -> bool {
-        if let Some(func) = &self.merge_func {
-            let aa = func;
-            return aa(block);
-        }
-        return Self::default_merge_permit(block);
-    }
-
-    fn default_merge_permit(block: BlockHeaderPtr) -> bool {
-        unsafe {
-            block.as_ref().is_valid() && block.as_ref().is_free()
         }
     }
 
@@ -358,15 +342,21 @@ impl <'a>Tlsf<'a> {
         }
     }
 
+    fn merge_permit(&self, block: BlockHeaderPtr) -> bool {
+        unsafe {
+            block.as_ref().is_valid() && block.as_ref().holder_id() == self.id && block.as_ref().is_free()
+        }
+    }
+
 }
 
-impl <'a>MemoryManager for Tlsf<'a> {
+impl MemoryManager for Tlsf {
     fn init_mem_pool(&mut self, addr: *mut u8, size: usize) {
-        let block = new_block_from_addr(addr, size, true, true, None);
+        let block = new_block_from_addr(self.id, addr, size, true, true, None);
         self.insert_free_block(block);
     }
 
-    fn allocate(&mut self, min_size: usize) -> Ptr<BlockHeader> {
+    fn allocate(&mut self, min_size: usize) ->  Option<(BlockHeaderPtr, bool)>{
         let timer = Instant::now();
         let id = thread::current().id();
         let mut size = min_size + core::mem::size_of::<UsedBlockHeader>();
@@ -395,7 +385,7 @@ impl <'a>MemoryManager for Tlsf<'a> {
 
                 // split the block to two blocks, one is used and the other is free
                 let new_block_addr = block.cast::<u8>().as_ptr().add(size);
-                let new_block = new_block_from_addr(new_block_addr, block_size - size, last, true, Some(block.cast()));
+                let new_block = new_block_from_addr(self.id, new_block_addr, block_size - size, last, true, Some(block.cast()));
                 split_block = Some(new_block);
                 last = false;
                 // insert new block to the free list
@@ -433,7 +423,7 @@ impl <'a>MemoryManager for Tlsf<'a> {
                 id, size, need_block_size, cost);
 
             // return user need block's start address
-            return Some(need_block.cast());
+            return Some((need_block.cast(), split));
         }
     }
 
@@ -449,7 +439,7 @@ impl <'a>MemoryManager for Tlsf<'a> {
 
 
             if !block.as_ref().is_valid() {
-                panic!("block is not free");
+                panic!("block is not valid");
             }
 
             debug_assert!(block.as_ref().is_valid());
@@ -492,7 +482,7 @@ impl <'a>MemoryManager for Tlsf<'a> {
             }
 
             // Create new free block
-            new_block.as_mut().initialize(new_size, new_last, true, new_prev_phys_block);
+            new_block.as_mut().initialize(self.id, new_size, new_last, true, new_prev_phys_block);
 
             // Update next block's prev_phys_block
             if let Some(mut next_phys_block) = need_update_next_block {
@@ -523,7 +513,8 @@ mod tests {
 
     #[test]
     fn test_block_header() {
-        let block_header = BlockHeader::new(16, true, true, None);
+        let block_header = BlockHeader::new(13, 16, true, true, None);
+        assert_eq!(block_header.holder_id(), 13);
         assert_eq!(block_header.size(), 16);
         assert_eq!(block_header.is_last(), true);
         assert_eq!(block_header.is_free(), true);
@@ -537,12 +528,13 @@ mod tests {
 
     #[test]
     fn test_tlsf_new() {
-        let tlsf = Tlsf::new(28, 4, 16);
+        let tlsf = Tlsf::new(
+            13, 28, 4, 16);
     }
 
     #[test]
     fn test_tlsf_map_search() {
-        let tlsf = Tlsf::new(28, 4, 16);
+        let tlsf = Tlsf::new(13, 28, 4, 16);
         assert_eq!(tlsf.map_search(16), Some((0, 0)));
         assert_eq!(tlsf.map_search(17), Some((0, 0)));
         assert_eq!(tlsf.map_search(20), Some((0, 1)));
@@ -555,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_tlsf_map_search_bigger() {
-        let tlsf = Tlsf::new(28, 4, 16);
+        let tlsf = Tlsf::new(13, 28, 4, 16);
         assert_eq!(tlsf.map_search_bigger(16), Some((0, 1)));
         assert_eq!(tlsf.map_search_bigger(17), Some((0, 1)));
         assert_eq!(tlsf.map_search_bigger(20), Some((0, 2)));
@@ -567,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_tlsf_search_free_block() {
-        let mut tlsf = Tlsf::new(28, 4, 16);
+        let mut tlsf = Tlsf::new(13, 28, 4, 16);
 
         tlsf.fl_bitmap.set(2, true);
         tlsf.sl_bitmap[2].set(1, true);
@@ -588,11 +580,11 @@ mod tests {
 
     #[test]
     fn test_cast() {
-        let mut tlsf = Tlsf::new(28, 4, 16);
+        let mut tlsf = Tlsf::new(13, 28, 4, 16);
         unsafe {
             let mut arena: [MaybeUninit<u8>;1024] = MaybeUninit::uninit().assume_init();
             let mut block_header_ptr : BlockHeaderPtr = NonNull::new_unchecked(arena.as_mut_ptr().cast());
-            block_header_ptr.as_mut().initialize(1024, true, true, None);
+            block_header_ptr.as_mut().initialize(13, 1024, true, true, None);
             assert_eq!(1024, block_header_ptr.as_ref().size());
             assert_eq!(block_header_ptr.as_ref().is_last(), true);
             assert_eq!(block_header_ptr.as_ref().is_free(), true);
@@ -629,12 +621,12 @@ mod tests {
 
     #[test]
     fn test_tlsf_insert_free_block() {
-        let mut tlsf: Tlsf = Tlsf::new(28, 4, 16);
+        let mut tlsf: Tlsf = Tlsf::new(13, 28, 4, 16);
         unsafe {
             assert_eq!(tlsf.search_free_block(16), None);
             let mut arena: [MaybeUninit<u8>;1024] = MaybeUninit::uninit().assume_init();
             let mut block_header_ptr : BlockHeaderPtr = NonNull::new_unchecked(arena.as_mut_ptr().cast());
-            block_header_ptr.as_mut().initialize(1024, true, true, None);
+            block_header_ptr.as_mut().initialize(13, 1024, true, true, None);
             tlsf.insert_free_block(block_header_ptr);
             
             assert_eq!(tlsf.search_free_block(16), Some((6, 0)));
@@ -645,12 +637,12 @@ mod tests {
 
     #[test]
     fn test_tlsf_remove_free_block() {
-        let mut tlsf: Tlsf = Tlsf::new(28, 4, 16);
+        let mut tlsf: Tlsf = Tlsf::new(13, 28, 4, 16);
         unsafe {
             assert_eq!(tlsf.search_free_block(16), None);
             let mut arena: [MaybeUninit<u8>;1024] = MaybeUninit::uninit().assume_init();
             let mut block_header_ptr : BlockHeaderPtr = NonNull::new_unchecked(arena.as_mut_ptr().cast());
-            block_header_ptr.as_mut().initialize(1024, true, true, None);
+            block_header_ptr.as_mut().initialize(13, 1024, true, true, None);
             tlsf.insert_free_block(block_header_ptr);
             
             assert_eq!(tlsf.search_free_block(16), Some((6, 0)));
@@ -664,19 +656,19 @@ mod tests {
 
     #[test]
     fn test_tlsf_insert_remove_free_block() {
-        let mut tlsf: Tlsf = Tlsf::new(28, 4, 16);
+        let mut tlsf: Tlsf = Tlsf::new(13, 28, 4, 16);
         unsafe {
             assert_eq!(tlsf.search_free_block(16), None);
             let mut arena: [MaybeUninit<u8>;10240] = MaybeUninit::uninit().assume_init();
             let mut block_header_ptr_0 : BlockHeaderPtr = NonNull::new_unchecked(arena.as_mut_ptr().cast());
-            block_header_ptr_0.as_mut().initialize(1024, false, true, None);
+            block_header_ptr_0.as_mut().initialize(13, 1024, false, true, None);
             tlsf.insert_free_block(block_header_ptr_0);
             
             assert_eq!(tlsf.search_free_block(16), Some((6, 0)));
             assert_eq!(tlsf.search_free_block(1023), Some((6, 0)));
             assert_eq!(tlsf.search_free_block(1024), None);
             let mut block_header_ptr_1 : BlockHeaderPtr = NonNull::new_unchecked(arena.as_mut_ptr().add(1024).cast());
-            block_header_ptr_1.as_mut().initialize(1024, true, true, None);
+            block_header_ptr_1.as_mut().initialize(13, 1024, true, true, None);
             tlsf.insert_free_block(block_header_ptr_1);
             assert_eq!(tlsf.search_free_block(16), Some((6, 0)));
             assert_eq!(tlsf.search_free_block(1023), Some((6, 0)));
@@ -711,7 +703,7 @@ mod tests {
 
     #[test]
     fn test_next_block() {
-        let mut tlsf: Tlsf = Tlsf::new(28, 4, 16);
+        let mut tlsf: Tlsf = Tlsf::new(13, 28, 4, 16);
         unsafe {
             assert_eq!(tlsf.allocate(16), None);
 
@@ -719,11 +711,11 @@ mod tests {
             let mut block_header_ptr : BlockHeaderPtr = NonNull::new_unchecked(arena.as_mut_ptr().cast());
             tlsf.init_mem_pool(arena.as_mut_ptr().cast(), 1024);
 
-            let ptr_0 = tlsf.allocate(128).unwrap();
+            let (ptr_0, _) = tlsf.allocate(128).unwrap();
 
-            let ptr_1 = tlsf.allocate(128).unwrap();
+            let (ptr_1, _) = tlsf.allocate(128).unwrap();
 
-            let ptr_2 = tlsf.allocate(128).unwrap();
+            let (ptr_2, _) = tlsf.allocate(128).unwrap();
 
             assert_eq!(ptr_0.as_ref().next_block(), Some(ptr_1));
             assert_eq!(ptr_1.as_ref().next_block(), Some(ptr_2));
@@ -733,7 +725,7 @@ mod tests {
 
     // #[test]
     fn test_allocate_deallocate() {
-        let mut tlsf: Tlsf = Tlsf::new(28, 4, 16);
+        let mut tlsf: Tlsf = Tlsf::new(13, 28, 4, 16);
         unsafe {
             assert_eq!(tlsf.allocate(16), None);
 
@@ -741,10 +733,9 @@ mod tests {
             let mut block_header_ptr : BlockHeaderPtr = NonNull::new_unchecked(arena.as_mut_ptr().cast());
             tlsf.init_mem_pool(arena.as_mut_ptr().cast(), 1024);
 
-            let ptr = tlsf.allocate(16);
-            assert_eq!(ptr.is_some(), true);
-            assert_eq!(block_header_ptr.cast(), ptr.unwrap());
-            let hdr = ptr.unwrap().cast::<UsedBlockHeader>();
+            let (ptr, _) = tlsf.allocate(16).unwrap();
+            assert_eq!(block_header_ptr.cast(), ptr);
+            let hdr = ptr.cast::<UsedBlockHeader>();
             assert_eq!(hdr.as_ref().block_header.size(), 40);
             assert_eq!(hdr.as_ref().block_header.is_free(), false);
             assert_eq!(hdr.as_ref().block_header.is_last(), false);
@@ -756,17 +747,15 @@ mod tests {
             let ptr3 = tlsf.allocate(986);
             assert_eq!(ptr3.is_some(), false);
 
-            let ptr4 = tlsf.allocate(879);
-            assert_eq!(ptr4.is_some(), true);
-            let hdr4 = ptr4.unwrap().cast::<UsedBlockHeader>();
+            let (ptr4, _) = tlsf.allocate(879).unwrap();
+            let hdr4 = ptr4.cast::<UsedBlockHeader>();
             assert_eq!(hdr4.as_ref().block_header.size(), 895);
             assert_eq!(hdr4.as_ref().block_header.is_free(), false);
             assert_eq!(hdr4.as_ref().block_header.is_last(), false);
             assert_eq!(hdr4.as_ref().block_header.get_prev_phys_block().unwrap().cast::<u8>(), hdr.cast());
 
-            let ptr5 = tlsf.allocate(69);
-            assert_eq!(ptr5.is_some(), true);
-            let hdr5 = ptr5.unwrap().cast::<UsedBlockHeader>();
+            let (ptr5, _) = tlsf.allocate(69).unwrap();
+            let hdr5 = ptr5.cast::<UsedBlockHeader>();
             assert_eq!(hdr5.as_ref().block_header.size(), 97);
             assert_eq!(hdr5.as_ref().block_header.is_free(), false);
             assert_eq!(hdr5.as_ref().block_header.is_last(), true);
@@ -775,26 +764,24 @@ mod tests {
             assert_eq!(tlsf.allocate(16), None);
 
             // deallocate block[927..1024]
-            tlsf.deallocate(ptr5.unwrap().cast());
-            let ptr6 = tlsf.allocate(69);
-            assert_eq!(ptr6.is_some(), true);
+            tlsf.deallocate(ptr5.cast());
+            let (ptr6, _) = tlsf.allocate(69).unwrap();
             assert_eq!(ptr5, ptr6);
 
             // deallocate block[0..32]
-            tlsf.deallocate(ptr.unwrap().cast());
+            tlsf.deallocate(ptr.cast());
             let ptr7 = tlsf.allocate(800);
             // only have 32B free block, so can't allocate 800B
             assert_eq!(ptr7.is_none(), true);
             
             // deallocate block[32..927]
-            tlsf.deallocate(ptr4.unwrap().cast());
+            tlsf.deallocate(ptr4.cast());
             // now we have 895B free block and 32B free block, we expect these two blocks are merged to a 927B free block
-            let ptr8 = tlsf.allocate(800);
-            assert_eq!(ptr8.is_some(), true);
-            let hdr8 = ptr8.unwrap().cast::<UsedBlockHeader>();
+            let (ptr8, _) = tlsf.allocate(800).unwrap();
+            let hdr8 = ptr8.cast::<UsedBlockHeader>();
             assert_eq!(hdr8.as_ref().block_header.size(), 816);
             assert_eq!(hdr8.as_ref().block_header.is_free(), false);
-            assert_eq!(block_header_ptr.cast(), ptr8.unwrap());
+            assert_eq!(block_header_ptr.cast(), ptr8);
         }
     }
 }
